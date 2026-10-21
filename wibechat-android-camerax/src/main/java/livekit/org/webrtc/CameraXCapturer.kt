@@ -23,11 +23,11 @@ import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.UseCase
 import androidx.lifecycle.LifecycleOwner
-import io.wibechat.android.room.track.video.CameraCapturerWithSize
-import io.wibechat.android.room.track.video.CameraEventsDispatchHandler
-import io.wibechat.android.util.FlowObservable
-import io.wibechat.android.util.flow
-import io.wibechat.android.util.flowDelegate
+import com.wibechat.android.room.track.video.CameraCapturerWithSize
+import com.wibechat.android.room.track.video.CameraEventsDispatchHandler
+import com.wibechat.android.util.FlowObservable
+import com.wibechat.android.util.flow
+import com.wibechat.android.util.flowDelegate
 import kotlinx.coroutines.flow.StateFlow
 
 @ExperimentalCamera2Interop

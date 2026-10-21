@@ -1,5 +1,5 @@
 # CameraX support for WibeChat Android SDK
-[![Maven Central](https://maven-badges.herokuapp.com/maven-central/io.wibechat/wibechat-android-camerax/badge.svg)](https://maven-badges.herokuapp.com/maven-central/io.wibechat/wibechat-android-camerax)
+[![Maven Central](https://maven-badges.herokuapp.com/maven-central/com.wibechat/wibechat-android-camerax/badge.svg)](https://maven-badges.herokuapp.com/maven-central/com.wibechat/wibechat-android-camerax)
 
 This library provides an CameraX integration for use with the Android WibeChat SDK. This provides access to more camera functionality such as custom zoom, torch control and taking a picture.
 
@@ -8,7 +8,7 @@ This library provides an CameraX integration for use with the Android WibeChat S
 ```groovy title="build.gradle"
 ...
 dependencies {
-  implementation "io.wibechat:wibechat-android-camerax:<current wibechat sdk release>"
+  implementation "com.wibechat:wibechat-android-camerax:<current wibechat sdk release>"
 }
 ```
 

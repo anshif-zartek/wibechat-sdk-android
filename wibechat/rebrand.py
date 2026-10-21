@@ -54,6 +54,8 @@ PROTECTED = re.compile("|".join([
 ]))
 
 PLACEHOLDER = re.compile("(\\d+)")
+# The io.livekit package / Maven group root, dotted or as a path.
+PACKAGE_ROOT = re.compile(r"(?<![\w-])io([./])livekit(?![\w-])")
 # "LK" class prefixes (LKLog) and "lk" property prefixes (lkObjects). Wire keys such as
 # "lk.agent.state" and the lkjingle native library are not followed by a capital letter.
 LK_PREFIX = re.compile(r"(?<![A-Z])LK(?=[A-Z][a-z])")
@@ -90,6 +92,7 @@ class Rebrander:
 
     def brand_words(self, text):
         c = self.conf
+        text = PACKAGE_ROOT.sub(lambda m: c["PACKAGE_ROOT"].replace(".", m.group(1)), text)
         text = text.replace("LIVEKIT", c["BRAND_UPPER"])
         text = text.replace("LiveKit", c["BRAND_PASCAL"])
         text = text.replace("Livekit", c["BRAND_CAPITALIZED"])

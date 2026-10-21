@@ -20,7 +20,7 @@
 
     <application>
         <service
-            android:name="io.wibechat.android.sample.service.ForegroundService"
+            android:name="com.wibechat.android.sample.service.ForegroundService"
             android:foregroundServiceType="mediaPlayback|camera|microphone"
             android:exported="false" />
     </application>

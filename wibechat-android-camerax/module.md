@@ -8,6 +8,6 @@ control.
 
 The core WibeChat CameraX package.
 
-# Package io.wibechat.android.camerax.ui
+# Package com.wibechat.android.camerax.ui
 
 Easy to use UI utilities for controlling the camera.

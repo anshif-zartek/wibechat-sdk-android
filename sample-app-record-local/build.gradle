@@ -4,12 +4,12 @@ plugins {
 }
 
 android {
-    namespace 'io.wibechat.android.sample.record'
+    namespace 'com.wibechat.android.sample.record'
     compileSdk androidSdk.compileVersion
 
 
     defaultConfig {
-        applicationId "io.wibechat.android.sample.record"
+        applicationId "com.wibechat.android.sample.record"
         minSdk androidSdk.minVersion
         targetSdk androidSdk.targetVersion
         versionCode 1

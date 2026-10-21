@@ -22,10 +22,10 @@ import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.UseCase
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
-import io.wibechat.android.room.track.LocalVideoTrackOptions
-import io.wibechat.android.room.track.video.CameraCapturerUtils
-import io.wibechat.android.room.track.video.CameraCapturerUtils.findCamera
-import io.wibechat.android.room.track.video.CameraEventsDispatchHandler
+import com.wibechat.android.room.track.LocalVideoTrackOptions
+import com.wibechat.android.room.track.video.CameraCapturerUtils
+import com.wibechat.android.room.track.video.CameraCapturerUtils.findCamera
+import com.wibechat.android.room.track.video.CameraEventsDispatchHandler
 
 @ExperimentalCamera2Interop
 class CameraXProvider(

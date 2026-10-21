@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace 'io.wibechat.android.example.screenshareaudio'
+    namespace 'com.wibechat.android.example.screenshareaudio'
     compileSdk 34
 
     defaultConfig {
-        applicationId "io.wibechat.android.example.screenshareaudio"
+        applicationId "com.wibechat.android.example.screenshareaudio"
         minSdk 29
         targetSdk 34
         versionCode 1
@@ -49,7 +49,7 @@ android {
 dependencies {
 
     // If building the sample app outside the context of this repo, replace the following with:
-    // api "io.wibechat:wibechat-android:<version>"
+    // api "com.wibechat:wibechat-android:<version>"
     api project(":wibechat-android-sdk")
     api project(":sample-app-common")
     implementation libs.androidx.core.ktx

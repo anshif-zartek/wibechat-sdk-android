@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace 'io.wibechat.android.selfie'
+    namespace 'com.wibechat.android.selfie'
     compileSdk androidSdk.compileVersion
 
     defaultConfig {
-        applicationId "io.wibechat.android.selfie"
+        applicationId "com.wibechat.android.selfie"
         minSdk androidSdk.minVersion
         targetSdk androidSdk.targetVersion
         versionCode 1

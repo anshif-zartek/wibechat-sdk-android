@@ -7,4 +7,4 @@ and video frames are passed into a `VideoFileRenderer` object, where they are th
 `android.media.MediaCodec`and saved using a `android.media.MediaMuxer` into a video file.
 
 Videos are saved to the app's external files directory (
-normally `/sdcard/Android/data/io.wibechat.android.sample.record/files/Movies`).
+normally `/sdcard/Android/data/com.wibechat.android.sample.record/files/Movies`).

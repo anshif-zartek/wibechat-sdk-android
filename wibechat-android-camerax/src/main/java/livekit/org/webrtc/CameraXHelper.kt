@@ -20,7 +20,7 @@ import android.hardware.camera2.CameraManager
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.UseCase
 import androidx.lifecycle.LifecycleOwner
-import io.wibechat.android.room.track.video.CameraCapturerUtils
+import com.wibechat.android.room.track.video.CameraCapturerUtils
 
 class CameraXHelper {
     companion object {

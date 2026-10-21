@@ -90,7 +90,7 @@
     <ID>TooManyFunctions:PublisherTransportObserver.kt$PublisherTransportObserver : ObserverListenerPeerConnectionStateObservable</ID>
     <ID>TooManyFunctions:RTCEngine.kt$RTCEngine : Listener</ID>
     <ID>TooManyFunctions:RTCEngine.kt$RTCEngine$Listener</ID>
-    <ID>TooManyFunctions:RTCMetricsManager.kt$io.wibechat.android.room.metrics.RTCMetricsManager.kt</ID>
+    <ID>TooManyFunctions:RTCMetricsManager.kt$com.wibechat.android.room.metrics.RTCMetricsManager.kt</ID>
     <ID>TooManyFunctions:RTCModule.kt$RTCModule</ID>
     <ID>TooManyFunctions:Room.kt$Room : ListenerParticipantListenerRpcManagerIncomingDataStreamManager</ID>
     <ID>TooManyFunctions:RpcServerManager.kt$RpcServerManager</ID>

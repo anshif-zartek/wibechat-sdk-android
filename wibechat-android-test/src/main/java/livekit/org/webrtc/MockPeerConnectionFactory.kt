@@ -16,11 +16,11 @@
 
 package livekit.org.webrtc
 
-import io.wibechat.android.test.mock.MockAudioSource
-import io.wibechat.android.test.mock.MockAudioStreamTrack
-import io.wibechat.android.test.mock.MockPeerConnection
-import io.wibechat.android.test.mock.MockVideoSource
-import io.wibechat.android.test.mock.MockVideoStreamTrack
+import com.wibechat.android.test.mock.MockAudioSource
+import com.wibechat.android.test.mock.MockAudioStreamTrack
+import com.wibechat.android.test.mock.MockPeerConnection
+import com.wibechat.android.test.mock.MockVideoSource
+import com.wibechat.android.test.mock.MockVideoStreamTrack
 
 class MockPeerConnectionFactory : PeerConnectionFactory(1L) {
     override fun createPeerConnectionInternal(

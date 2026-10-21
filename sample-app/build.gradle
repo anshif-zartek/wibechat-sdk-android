@@ -5,11 +5,11 @@ plugins {
 }
 
 android {
-    namespace "io.wibechat.android.sample"
+    namespace "com.wibechat.android.sample"
     compileSdkVersion androidSdk.compileVersion
 
     defaultConfig {
-        applicationId "io.wibechat.android"
+        applicationId "com.wibechat.android"
         minSdkVersion androidSdk.minVersion
         targetSdkVersion androidSdk.targetVersion
         versionCode 1

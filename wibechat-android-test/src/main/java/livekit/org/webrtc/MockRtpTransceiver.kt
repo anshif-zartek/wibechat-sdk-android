@@ -16,8 +16,8 @@
 
 package livekit.org.webrtc
 
-import io.wibechat.android.test.mock.MockRtpReceiver
-import io.wibechat.android.test.mock.MockRtpSender
+import com.wibechat.android.test.mock.MockRtpReceiver
+import com.wibechat.android.test.mock.MockRtpSender
 import livekit.org.webrtc.RtpTransceiver.RtpTransceiverDirection
 import org.mockito.Mockito
 import java.util.UUID

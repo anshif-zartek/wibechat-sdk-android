@@ -12,9 +12,9 @@
     kotlinx.serialization.KSerializer serializer(...);
 }
 
--keep,includedescriptorclasses class io.wibechat.android.**$$serializer { *; }
+-keep,includedescriptorclasses class com.wibechat.android.**$$serializer { *; }
 
--keepclasseswithmembers class io.wibechat.android.** {
+-keepclasseswithmembers class com.wibechat.android.** {
     kotlinx.serialization.KSerializer serializer(...);
 }
 

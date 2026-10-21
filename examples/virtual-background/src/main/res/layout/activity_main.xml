@@ -5,7 +5,7 @@
     android:layout_height="match_parent"
     tools:context=".MainActivity">
 
-    <io.wibechat.android.renderer.TextureViewRenderer
+    <com.wibechat.android.renderer.TextureViewRenderer
         android:id="@+id/renderer"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />

@@ -1,0 +1,1927 @@
+/*
+ * Copyright 2023-2026 LiveKit, Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.wibechat.android.room
+
+import android.os.SystemClock
+import androidx.annotation.CheckResult
+import androidx.annotation.VisibleForTesting
+import com.google.protobuf.ByteString
+import com.vdurmont.semver4j.Semver
+import com.wibechat.android.ConnectOptions
+import com.wibechat.android.RoomOptions
+import com.wibechat.android.dagger.InjectionNames
+import com.wibechat.android.e2ee.DataPacketCryptorManager
+import com.wibechat.android.e2ee.E2EEManager
+import com.wibechat.android.e2ee.EncryptedPacket
+import com.wibechat.android.events.DisconnectReason
+import com.wibechat.android.events.convert
+import com.wibechat.android.room.datatrack.DataTrackPublishException
+import com.wibechat.android.room.datatrack.DataTrackPublisherChannel
+import com.wibechat.android.room.datatrack.IncomingDataTrackManager
+import com.wibechat.android.room.datatrack.OutgoingDataTrackManager
+import com.wibechat.android.room.network.DefaultReconnectPolicy
+import com.wibechat.android.room.network.ReconnectContext
+import com.wibechat.android.room.network.ReconnectPolicy
+import com.wibechat.android.room.participant.Participant
+import com.wibechat.android.room.participant.ParticipantTrackPermission
+import com.wibechat.android.room.track.TrackException
+import com.wibechat.android.room.util.MediaConstraintKeys
+import com.wibechat.android.room.util.createAnswer
+import com.wibechat.android.room.util.setLocalDescription
+import com.wibechat.android.room.util.waitUntilConnected
+import com.wibechat.android.util.CloseableCoroutineScope
+import com.wibechat.android.util.Either
+import com.wibechat.android.util.FlowObservable
+import com.wibechat.android.util.WCLog
+import com.wibechat.android.util.TTLMap
+import com.wibechat.android.util.flow
+import com.wibechat.android.util.flowDelegate
+import com.wibechat.android.util.nullSafe
+import com.wibechat.android.util.rethrowIfCancellationSignal
+import com.wibechat.android.util.withCheckLock
+import com.wibechat.android.util.withDeadline
+import com.wibechat.android.webrtc.DataChannelManager
+import com.wibechat.android.webrtc.DataPacketBuffer
+import com.wibechat.android.webrtc.DataPacketItem
+import com.wibechat.android.webrtc.RTCStatsGetter
+import com.wibechat.android.webrtc.copy
+import com.wibechat.android.webrtc.isConnected
+import com.wibechat.android.webrtc.isDisconnected
+import com.wibechat.android.webrtc.peerconnection.RTCThreadToken
+import com.wibechat.android.webrtc.peerconnection.executeBlockingOnRTCThread
+import com.wibechat.android.webrtc.peerconnection.launchBlockingOnRTCThread
+import com.wibechat.android.webrtc.toProtoSessionDescription
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.yield
+import wibechat.WibechatModels
+import wibechat.WibechatModels.AudioTrackFeature
+import wibechat.WibechatRtc
+import wibechat.WibechatRtc.JoinResponse
+import wibechat.WibechatRtc.LeaveRequest
+import wibechat.WibechatRtc.ReconnectResponse
+import livekit.org.webrtc.DataChannel
+import livekit.org.webrtc.IceCandidate
+import livekit.org.webrtc.MediaConstraints
+import livekit.org.webrtc.MediaStream
+import livekit.org.webrtc.MediaStreamTrack
+import livekit.org.webrtc.PeerConnection
+import livekit.org.webrtc.PeerConnection.PeerConnectionState
+import livekit.org.webrtc.PeerConnection.RTCConfiguration
+import livekit.org.webrtc.RTCStatsCollectorCallback
+import livekit.org.webrtc.RTCStatsReport
+import livekit.org.webrtc.RtpReceiver
+import livekit.org.webrtc.RtpSender
+import livekit.org.webrtc.RtpTransceiver
+import livekit.org.webrtc.RtpTransceiver.RtpTransceiverInit
+import livekit.org.webrtc.SessionDescription
+import java.nio.ByteBuffer
+import javax.inject.Inject
+import javax.inject.Named
+import javax.inject.Singleton
+import kotlin.coroutines.Continuation
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
+
+/**
+ * @suppress
+ */
+@Singleton
+class RTCEngine
+@Inject
+internal constructor(
+    val client: SignalClient,
+    private val pctFactory: PeerConnectionTransport.Factory,
+    @Named(InjectionNames.DISPATCHER_IO)
+    private val ioDispatcher: CoroutineDispatcher,
+    private val rtcThreadToken: RTCThreadToken,
+    private val dataPacketCryptorFactory: DataPacketCryptorManager.Factory,
+    private val outgoingDataTrackManager: OutgoingDataTrackManager,
+    private val incomingDataTrackManager: IncomingDataTrackManager,
+) : SignalClient.Listener {
+    internal var listener: Listener? = null
+
+    /**
+     * When the current connection attempt began, taken at the top of [joinImpl]. Cleared once the
+     * primary transport connects, so the attempt is timed exactly once.
+     */
+    private var connectStartedAtMs: Long? = null
+
+    /**
+     * Reflects the combined connection state of SignalClient and primary PeerConnection.
+     */
+    @FlowObservable
+    @get:FlowObservable
+    var connectionState: ConnectionState by flowDelegate(ConnectionState.DISCONNECTED) { newVal, oldVal ->
+        if (newVal == oldVal) {
+            return@flowDelegate
+        }
+        when (newVal) {
+            ConnectionState.CONNECTED -> {
+                signalSessionState = SignalSessionState(ended = false)
+                if (oldVal != ConnectionState.RESUMING) {
+                    recordConnectionSetupTime()
+                }
+                if (oldVal == ConnectionState.DISCONNECTED || oldVal == ConnectionState.CONNECTING) {
+                    WCLog.d { "primary ICE connected" }
+                    listener?.onEngineConnected()
+                } else if (oldVal == ConnectionState.RECONNECTING) {
+                    WCLog.d { "primary ICE reconnected" }
+                    listener?.onEngineReconnected()
+                } else if (oldVal == ConnectionState.RESUMING) {
+                    listener?.onEngineResumed()
+                }
+            }
+
+            ConnectionState.DISCONNECTED -> {
+                WCLog.d { "primary ICE disconnected" }
+                if (oldVal == ConnectionState.CONNECTED) {
+                    reconnect()
+                }
+            }
+
+            else -> {
+            }
+        }
+    }
+
+    @Volatile
+    internal var reconnectType: ReconnectType = ReconnectType.DEFAULT
+
+    @Volatile
+    private var reconnectingJob: Job? = null
+
+    /**
+     * Replaced at each signal session boundary. Sender handles retain the state that owned their
+     * transceiver, so cleanup cannot mutate a publisher after that session ends.
+     */
+    @Volatile
+    private var signalSessionState = SignalSessionState(ended = true)
+
+    @Volatile
+    private var fullReconnectOnNext = false
+
+    internal var reconnectPolicy: ReconnectPolicy = DefaultReconnectPolicy()
+
+    private val pendingTrackResolvers: MutableMap<String, Continuation<WibechatModels.TrackInfo>> =
+        mutableMapOf()
+
+    internal var regionUrlProvider: RegionUrlProvider? = null
+    private var sessionUrl: String? = null
+    private var sessionToken: String? = null
+    private var connectOptions: ConnectOptions? = null
+    private var lastRoomOptions: RoomOptions? = null
+    private var participantSid: String? = null
+    private var localParticipantIdentity: String? = null
+
+    internal val serverVersion: Semver?
+        get() = client.serverVersion
+
+    internal val serverInfo: ServerInfo?
+        get() = client.serverInfo
+
+    private val publisherObserver = PublisherTransportObserver(this, client, rtcThreadToken)
+    private val subscriberObserver = SubscriberTransportObserver(this, client, rtcThreadToken)
+
+    internal var publisher: PeerConnectionTransport? = null
+    private var subscriber: PeerConnectionTransport? = null
+
+    private var reliableDataChannel: DataChannel? = null
+    private var reliableDataChannelSub: DataChannel? = null
+    private var lossyDataChannel: DataChannel? = null
+    private var lossyDataChannelSub: DataChannel? = null
+    private var dataTrackDataChannelSub: DataChannel? = null
+    private val dataTrackPublisherChannel = DataTrackPublisherChannel(rtcThreadToken)
+    private var reliableDataChannelManager: DataChannelManager? = null
+    private var reliableBufferedAmountJob: Job? = null
+    private var reliableDataChannelSubManager: DataChannelManager? = null
+    private var lossyDataChannelManager: DataChannelManager? = null
+    private var lossyDataChannelSubManager: DataChannelManager? = null
+
+    private val reliableStateLock = Object()
+    private var reliableDataSequence: Int = 1
+    private val reliableMessageBuffer = DataPacketBuffer(RELIABLE_RETRY_AMOUNT)
+    private val reliableReceivedState = TTLMap<String, Int>(RELIABLE_RECEIVE_STATE_TTL_MS)
+
+    private var isSubscriberPrimary = false
+
+    @Volatile
+    private var isClosed = true
+
+    @Volatile
+    private var hasPublished = false
+
+    private var coroutineScope = CloseableCoroutineScope(SupervisorJob() + ioDispatcher)
+
+    internal var e2EEManager: E2EEManager? = null
+    private val dataPacketCryptorManager: DataPacketCryptorManager?
+        get() = e2EEManager?.dataPacketCryptorManager
+
+    /**
+     * Note: If this lock is ever used in conjunction with the RTC thread,
+     * this must be grabbed on the RTC thread to prevent deadlocks.
+     */
+    private var configurationLock = Mutex()
+
+    /**
+     * Prevents concurrent publisher negotiations which can cause ICE gathering
+     * race conditions and connection failures.
+     */
+    private val negotiatePublisherMutex = Mutex()
+
+    init {
+        client.listener = this
+    }
+
+    suspend fun join(
+        url: String,
+        token: String,
+        options: ConnectOptions,
+        roomOptions: RoomOptions,
+    ): JoinResponse {
+        coroutineScope.close()
+        coroutineScope = CloseableCoroutineScope(SupervisorJob() + ioDispatcher)
+        sessionUrl = url
+        sessionToken = token
+        connectOptions = options
+        lastRoomOptions = roomOptions
+        return joinImpl(url, token, options, roomOptions)
+    }
+
+    /**
+     * Hands the time from the start of [joinImpl] to the primary transport connecting to the
+     * publisher, which lowers the start bitrate hint for a slow connection. Runs for the initial
+     * join and for a full reconnect, which both go through [joinImpl] and build a new publisher;
+     * a resume keeps its peer connections and their estimator, so it never records one. The
+     * publisher also knows when the attempt began, so a video offer created before this fires
+     * (an app publishing as soon as the join completes) uses the time elapsed so far.
+     */
+    private fun recordConnectionSetupTime() {
+        val startedAtMs = connectStartedAtMs ?: return
+        connectStartedAtMs = null
+        val setupTime = (SystemClock.elapsedRealtime() - startedAtMs).milliseconds
+        WCLog.i { "connection setup took ${setupTime.inWholeMilliseconds} ms" }
+        publisher?.setConnectionSetupTime(setupTime)
+    }
+
+    suspend fun joinImpl(
+        url: String,
+        token: String,
+        options: ConnectOptions,
+        roomOptions: RoomOptions,
+    ): JoinResponse = coroutineScope {
+        val startedAtMs = SystemClock.elapsedRealtime()
+        connectStartedAtMs = startedAtMs
+        if (connectionState == ConnectionState.DISCONNECTED) {
+            connectionState = ConnectionState.CONNECTING
+        }
+        val joinResponse = client.join(url, token, options, roomOptions)
+        ensureActive()
+
+        if (joinResponse.hasParticipant()) {
+            localParticipantIdentity = joinResponse.participant.identity
+        }
+        // Participants first, then the original join bytes (Swift order): UniFFI discovers
+        // tracks once publishers are registered, and re-encoding would drop newer fields.
+        listener?.onJoinResponse(joinResponse)
+        incomingDataTrackManager.handleSfuJoinResponse(
+            client.lastJoinEncoded
+                ?: WibechatRtc.SignalResponse.newBuilder()
+                    .setJoin(joinResponse)
+                    .build()
+                    .toByteArray(),
+        )
+        listener?.reattachRemoteDataTracks()
+        isClosed = false
+        listener?.onSignalConnected(false)
+
+        isSubscriberPrimary = joinResponse.subscriberPrimary
+
+        configure(joinResponse, options)
+        // The publisher created above needs the attempt's start time before its first offer, in
+        // case video is published before the primary transport connects.
+        publisher?.setConnectStartedAt(startedAtMs)
+
+        // Subscriber-primary defers the publisher PC until something is published. After a full
+        // reconnect `hasPublished` is still set, so re-negotiate here — otherwise the ICE wait
+        // stalls and data-track republish never runs.
+        if (!isSubscriberPrimary || joinResponse.fastPublish || hasPublished) {
+            negotiatePublisher()
+        }
+        client.onReadyForResponses()
+
+        return@coroutineScope joinResponse
+    }
+
+    private suspend fun configure(joinResponse: JoinResponse, connectOptions: ConnectOptions) {
+        launchBlockingOnRTCThread(rtcThreadToken) {
+            configurationLock.withCheckLock(
+                {
+                    ensureActive()
+                    if (publisher != null && subscriber != null) {
+                        // already configured
+                        return@launchBlockingOnRTCThread
+                    }
+                },
+            ) {
+                participantSid = if (joinResponse.hasParticipant()) {
+                    joinResponse.participant.sid
+                } else {
+                    null
+                }
+
+                // Setup peer connections
+                val rtcConfig = makeRTCConfig(Either.Left(joinResponse), connectOptions)
+
+                publisher?.close()
+                publisher = pctFactory.create(
+                    rtcConfig,
+                    publisherObserver,
+                    publisherObserver,
+                )
+                subscriber?.close()
+                subscriber = pctFactory.create(
+                    rtcConfig,
+                    subscriberObserver,
+                    null,
+                )
+
+                val connectionStateListener: PeerConnectionStateListener = { newState ->
+                    WCLog.v { "onIceConnection new state: $newState" }
+                    if (newState.isConnected()) {
+                        connectionState = ConnectionState.CONNECTED
+                    } else if (newState.isDisconnected()) {
+                        connectionState = ConnectionState.DISCONNECTED
+                    }
+                }
+
+                if (joinResponse.subscriberPrimary) {
+                    // in subscriber primary mode, server side opens sub data channels.
+                    subscriberObserver.dataChannelListener = onDataChannel@{ dataChannel: DataChannel ->
+                        when (dataChannel.label()) {
+                            RELIABLE_DATA_CHANNEL_LABEL -> reliableDataChannelSub = dataChannel
+                            LOSSY_DATA_CHANNEL_LABEL -> lossyDataChannelSub = dataChannel
+                            DATA_TRACK_DATA_CHANNEL_LABEL -> dataTrackDataChannelSub = dataChannel
+                            else -> return@onDataChannel
+                        }
+                        dataChannel.registerObserver(DataChannelObserver(dataChannel))
+                    }
+
+                    subscriberObserver.connectionChangeListener = connectionStateListener
+                    // Also reconnect on publisher disconnect
+                    publisherObserver.connectionChangeListener = { newState ->
+                        if (newState.isDisconnected()) {
+                            reconnect()
+                        }
+                    }
+                } else {
+                    publisherObserver.connectionChangeListener = connectionStateListener
+                }
+
+                ensureActive()
+                // data channels
+                val reliableInit = DataChannel.Init()
+                reliableInit.ordered = true
+                reliableDataChannel = publisher?.withPeerConnection {
+                    createDataChannel(
+                        RELIABLE_DATA_CHANNEL_LABEL,
+                        reliableInit,
+                    ).also { dataChannel ->
+
+                        val dataChannelManager = DataChannelManager(dataChannel, DataChannelObserver(dataChannel), rtcThreadToken)
+                        reliableDataChannelManager = dataChannelManager
+                        dataChannel.registerObserver(dataChannelManager)
+                        reliableBufferedAmountJob?.cancel()
+                        reliableBufferedAmountJob = coroutineScope.launch {
+                            dataChannelManager::bufferedAmount.flow.collect { bufferedAmount ->
+                                synchronized(reliableStateLock) {
+                                    reliableMessageBuffer.trim(bufferedAmount)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                ensureActive()
+                val lossyInit = DataChannel.Init()
+                lossyInit.ordered = false
+                lossyInit.maxRetransmits = 0
+                lossyDataChannel = publisher?.withPeerConnection {
+                    createDataChannel(
+                        LOSSY_DATA_CHANNEL_LABEL,
+                        lossyInit,
+                    ).also { dataChannel ->
+                        lossyDataChannelManager = DataChannelManager(dataChannel, DataChannelObserver(dataChannel), rtcThreadToken)
+                        dataChannel.registerObserver(lossyDataChannelManager)
+                    }
+                }
+
+                ensureActive()
+                createPublisherDataTrackChannel()
+            }
+        }
+    }
+
+    /**
+     * @param builder an optional builder to include other parameters related to the track
+     */
+    suspend fun addTrack(
+        cid: String,
+        name: String,
+        kind: WibechatModels.TrackType,
+        stream: String?,
+        builder: WibechatRtc.AddTrackRequest.Builder = WibechatRtc.AddTrackRequest.newBuilder(),
+    ): WibechatModels.TrackInfo {
+        synchronized(pendingTrackResolvers) {
+            if (pendingTrackResolvers[cid] != null) {
+                throw TrackException.DuplicateTrackException("Track with same ID $cid has already been published!")
+            }
+        }
+
+        // Suspend until signal client receives message confirming track publication.
+        return withDeadline(20.seconds) {
+            suspendCancellableCoroutine { cont ->
+                synchronized(pendingTrackResolvers) {
+                    pendingTrackResolvers[cid] = cont
+                }
+                cont.invokeOnCancellation {
+                    synchronized(pendingTrackResolvers) {
+                        if (pendingTrackResolvers[cid] === cont) {
+                            pendingTrackResolvers.remove(cid)
+                        }
+                    }
+                }
+                client.sendAddTrack(
+                    cid = cid,
+                    name = name,
+                    type = kind,
+                    stream = stream,
+                    builder = builder,
+                )
+            }
+        }
+    }
+
+    internal suspend fun createSenderTransceiver(
+        rtcTrack: MediaStreamTrack,
+        transInit: RtpTransceiverInit,
+    ): SenderTransceiverHandle? {
+        val sessionState = signalSessionState
+        val publisher = publisher ?: return null
+        val transceiver = publisher.withPeerConnection {
+            addTransceiver(rtcTrack, transInit)
+        } ?: return null
+        return SenderTransceiverHandle(publisher, transceiver, sessionState)
+    }
+
+    fun updateSubscriptionPermissions(
+        allParticipants: Boolean,
+        participantTrackPermissions: List<ParticipantTrackPermission>,
+    ) {
+        client.sendUpdateSubscriptionPermissions(allParticipants, participantTrackPermissions)
+    }
+
+    fun updateMuteStatus(sid: String, muted: Boolean) {
+        client.sendMuteTrack(sid, muted)
+    }
+
+    fun updateLocalAudioTrack(sid: String, features: Collection<AudioTrackFeature>) {
+        client.sendUpdateLocalAudioTrack(sid, features)
+    }
+
+    fun close(reason: String = "Normal Closure") {
+        if (isClosed) {
+            return
+        }
+        WCLog.v { "Close - $reason" }
+        isClosed = true
+        reconnectingJob?.cancel()
+        reconnectingJob = null
+        coroutineScope.close()
+        hasPublished = false
+        sessionUrl = null
+        sessionToken = null
+        connectOptions = null
+        lastRoomOptions = null
+        participantSid = null
+        localParticipantIdentity = null
+        regionUrlProvider = null
+        endSignalSession()
+        abortPendingPublishTracks()
+        closeResources(reason)
+        outgoingDataTrackManager.close()
+        incomingDataTrackManager.close()
+        connectionState = ConnectionState.DISCONNECTED
+
+        synchronized(reliableStateLock) {
+            reliableDataSequence = 1
+            reliableMessageBuffer.clear()
+            reliableReceivedState.clear()
+        }
+    }
+
+    private fun closeResources(reason: String) {
+        executeBlockingOnRTCThread(rtcThreadToken) {
+            runBlocking {
+                configurationLock.withLock {
+                    publisherObserver.connectionChangeListener = null
+                    subscriberObserver.connectionChangeListener = null
+                    publisher?.closeBlocking()
+                    publisher = null
+                    subscriber?.closeBlocking()
+                    subscriber = null
+
+                    reliableBufferedAmountJob?.cancel()
+                    reliableBufferedAmountJob = null
+                    reliableDataChannelManager?.dispose()
+                    reliableDataChannelManager = null
+                    reliableDataChannel = null
+                    reliableDataChannelSubManager?.dispose()
+                    reliableDataChannelSubManager = null
+                    reliableDataChannelSub = null
+                    lossyDataChannelManager?.dispose()
+                    lossyDataChannelManager = null
+                    lossyDataChannel = null
+                    lossyDataChannelSubManager?.dispose()
+                    lossyDataChannelSubManager = null
+                    lossyDataChannelSub = null
+                    dataTrackPublisherChannel.detach()
+                    dataTrackDataChannelSub = null
+                    isSubscriberPrimary = false
+                }
+            }
+        }
+        client.close(reason = reason)
+    }
+
+    /**
+     * Marks the current signal session as finished, so publish cleanup that resumes afterwards
+     * leaves the publisher alone.
+     *
+     * Precedes [abortPendingPublishTracks]: each abort unwinds a publish into that cleanup, and
+     * on some paths the reconnect which would otherwise end the session only runs later, when
+     * the socket closes.
+     */
+    private fun endSignalSession() {
+        signalSessionState = SignalSessionState(ended = true)
+    }
+
+    private fun abortPendingPublishTracks() {
+        synchronized(pendingTrackResolvers) {
+            pendingTrackResolvers.values.forEach {
+                it.resumeWithException(TrackException.PublishException("pending track aborted"))
+            }
+            pendingTrackResolvers.clear()
+        }
+    }
+
+    /**
+     * reconnect Signal and PeerConnections
+     */
+    @Synchronized
+    @VisibleForTesting(otherwise = VisibleForTesting.PACKAGE_PRIVATE)
+    fun reconnect() {
+        if (reconnectingJob?.isActive == true) {
+            WCLog.d { "Reconnection is already in progress" }
+            return
+        }
+        if (this.isClosed) {
+            WCLog.d { "Skip reconnection - engine is closed" }
+            return
+        }
+        var url = sessionUrl
+        val token = sessionToken
+        if (url == null || token == null) {
+            WCLog.w { "couldn't reconnect, no url or no token" }
+            return
+        }
+        val forceFullReconnect = fullReconnectOnNext
+        fullReconnectOnNext = false
+        endSignalSession()
+        val job = coroutineScope.launch {
+            var hasResumedOnce = false
+            var hasReconnectedOnce = false
+
+            val reconnectStartTime = SystemClock.elapsedRealtime()
+            val reconnectPolicy = this@RTCEngine.reconnectPolicy
+
+            for (retries in 0 until MAX_RECONNECT_RETRIES) {
+                // First try use previously valid url.
+                if (retries != 0) {
+                    try {
+                        url = regionUrlProvider?.getNextBestRegionUrl() ?: url
+                    } catch (e: Exception) {
+                        e.rethrowIfCancellationSignal()
+                        WCLog.d(e) { "Exception while getting next best region url while reconnecting." }
+                    }
+                }
+
+                ensureActive()
+                if (retries != 0) {
+                    yield()
+                }
+
+                if (isClosed) {
+                    WCLog.v { "RTCEngine closed, aborting reconnection" }
+                    break
+                }
+
+                val reconnectContext = ReconnectContext(
+                    retryCount = retries,
+                    elapsedTime = (SystemClock.elapsedRealtime() - reconnectStartTime).milliseconds,
+                )
+                val startDelay = reconnectPolicy.getNextRetryDelay(reconnectContext)
+                if (startDelay == null) {
+                    WCLog.i { "cancelling reconnection due to policy." }
+                    break
+                }
+
+                WCLog.i { "Reconnecting to signal, attempt ${retries + 1}" }
+                delay(startDelay)
+
+                val isFullReconnect = when (reconnectType) {
+                    // full reconnect after first try.
+                    ReconnectType.DEFAULT -> retries != 0 || forceFullReconnect
+                    ReconnectType.FORCE_SOFT_RECONNECT -> false
+                    ReconnectType.FORCE_FULL_RECONNECT -> true
+                }
+
+                var lastMessageSeq: Int? = null
+                val connectOptions = connectOptions ?: ConnectOptions()
+                if (isFullReconnect) {
+                    WCLog.v { "Attempting full reconnect." }
+
+                    if (!hasReconnectedOnce) {
+                        hasReconnectedOnce = true
+                        listener?.onEngineReconnecting()
+                    }
+                    connectionState = ConnectionState.RECONNECTING
+                    try {
+                        closeResources("Full Reconnecting")
+                        listener?.onFullReconnecting()
+                        joinImpl(url!!, token, connectOptions, lastRoomOptions ?: RoomOptions())
+                    } catch (e: Exception) {
+                        e.rethrowIfCancellationSignal()
+                        WCLog.w(e) { "Error during reconnection." }
+                        // reconnect failed, retry.
+                        continue
+                    }
+                } else {
+                    if (!hasResumedOnce) {
+                        hasResumedOnce = true
+                        listener?.onEngineResuming()
+                    }
+                    connectionState = ConnectionState.RESUMING
+                    WCLog.v { "Attempting soft reconnect." }
+                    subscriber?.prepareForIceRestart()
+                    try {
+                        val response = client.reconnect(url!!, token, participantSid)
+                        if (response is Either.Left) {
+                            val reconnectResponse = response.value
+                            val rtcConfig = makeRTCConfig(Either.Right(reconnectResponse), connectOptions)
+                            subscriber?.updateRTCConfig(rtcConfig)
+                            publisher?.updateRTCConfig(rtcConfig)
+                            lastMessageSeq = reconnectResponse.lastMessageSeq
+                        } else {
+                            WCLog.w { "Did not receive reconnect response" }
+                        }
+                        client.onReadyForResponses()
+                    } catch (e: Exception) {
+                        e.rethrowIfCancellationSignal()
+                        WCLog.w(e) { "Error during reconnection." }
+                        // ws reconnect failed, retry.
+                        continue
+                    }
+
+                    WCLog.v { "ws reconnected, restarting ICE" }
+                    listener?.onSignalConnected(true)
+
+                    // trigger publisher reconnect
+                    // only restart publisher if it's needed
+                    if (hasPublished) {
+                        negotiatePublisher()
+                    }
+                }
+
+                ensureActive()
+                if (isClosed) {
+                    WCLog.v { "RTCEngine closed, aborting reconnection" }
+                    break
+                }
+
+                withTimeoutOrNull(MAX_ICE_CONNECT_TIMEOUT_MS.toLong()) {
+                    // wait until publisher ICE connected
+                    var publisherWaitJob: Job? = null
+                    if (hasPublished) {
+                        publisherWaitJob = launch {
+                            publisherObserver.waitUntilConnected()
+                        }
+                    }
+
+                    // wait until subscriber ICE connected
+                    val subscriberWaitJob = launch {
+                        subscriberObserver.waitUntilConnected()
+                    }
+
+                    listOfNotNull(publisherWaitJob, subscriberWaitJob)
+                        .joinAll()
+                }
+
+                ensureActive()
+                if (isClosed) {
+                    WCLog.v { "RTCEngine closed, aborting reconnection" }
+                    break
+                }
+
+                val subscriberConnected = subscriber?.isConnected() == true
+                val publisherConnected = !hasPublished || publisher?.isConnected() == true
+                if ((connectionState == ConnectionState.CONNECTED || connectionState == ConnectionState.RESUMING) &&
+                    subscriberConnected &&
+                    publisherConnected
+                ) {
+                    if (connectionState == ConnectionState.RESUMING) {
+                        connectionState = ConnectionState.CONNECTED
+                    }
+                    if (lastMessageSeq != null) {
+                        resendReliableMessagesForResume(lastMessageSeq).onFailure { e ->
+                            WCLog.w(e) {
+                                "Reliable data replay did not complete on resume; " +
+                                    "buffered items remain queued for the next resume."
+                            }
+                        }
+                    }
+                    // Is connected, notify and return.
+                    regionUrlProvider?.clearAttemptedRegions()
+                    client.onPCConnected()
+                    if (isFullReconnect) {
+                        outgoingDataTrackManager.republishTracks()
+                    }
+                    incomingDataTrackManager.resendSubscriptionUpdates()
+                    listener?.onPostReconnect(isFullReconnect)
+                    return@launch
+                }
+
+                // Didn't manage to reconnect, check if should continue to next attempt.
+                val curReconnectTime = SystemClock.elapsedRealtime() - reconnectStartTime
+                if (curReconnectTime > MAX_RECONNECT_TIMEOUT) {
+                    break
+                }
+            }
+
+            close("Failed reconnecting")
+            listener?.onEngineDisconnected(DisconnectReason.UNKNOWN_REASON)
+        }
+
+        reconnectingJob = job
+        job.invokeOnCompletion {
+            if (reconnectingJob == job) {
+                reconnectingJob = null
+            }
+        }
+    }
+
+    internal fun negotiatePublisher() {
+        // Mark intent to publish before checking Signal state so reconnect() can
+        // re-trigger negotiation even if the first attempt occurs before Signal connects.
+        hasPublished = true
+
+        if (!client.isConnected) {
+            return
+        }
+
+        coroutineScope.launch {
+            negotiatePublisherMutex.withLock {
+                publisher?.negotiate?.invoke(getPublisherOfferConstraints())
+            }
+        }
+    }
+
+    @CheckResult
+    internal suspend fun sendData(dataPacket: WibechatModels.DataPacket): Result<Unit> {
+        try {
+            ensurePublisherConnected(dataPacket.kind)
+        } catch (e: Exception) {
+            e.rethrowIfCancellationSignal()
+            return Result.failure(e)
+        }
+
+        fun sendDataImpl(dataPacket: WibechatModels.DataPacket): Result<Unit> {
+            try {
+                // Redeclare to make variable
+                var dataPacket = dataPacket
+
+                val e2EEManager = e2EEManager
+                val dataEncryptionEnabled = e2EEManager?.isDataChannelEncryptionEnabled() ?: false
+                if (dataEncryptionEnabled && e2EEManager != null) {
+                    val encryptedPacketPayload = dataPacket.asEncryptedPacketPayload()
+                    if (encryptedPacketPayload != null) {
+                        val encryptedData = e2EEManager.encrypt(encryptedPacketPayload.toByteArray())
+                        if (encryptedData != null) {
+                            dataPacket = with(dataPacket.toBuilder()) {
+                                encryptedPacket = with(WibechatModels.EncryptedPacket.newBuilder()) {
+                                    encryptedValue = ByteString.copyFrom(encryptedData.payload)
+                                    iv = ByteString.copyFrom(encryptedData.iv)
+                                    keyIndex = encryptedData.keyIndex
+                                    encryptionType = WibechatModels.Encryption.Type.GCM
+                                    build()
+                                }
+                                build()
+                            }
+                        }
+                    }
+                }
+
+                val isReliable = dataPacket.kind == WibechatModels.DataPacket.Kind.RELIABLE
+                if (isReliable) {
+                    dataPacket = dataPacket.toBuilder()
+                        .setSequence(reliableDataSequence)
+                        .build()
+                }
+
+                val packetBytes = dataPacket.toByteArray()
+
+                if (packetBytes.size > MAX_DATA_PACKET_SIZE) {
+                    return Result.failure(IllegalArgumentException("packet size (${packetBytes.size}) exceeds the max size (${MAX_DATA_PACKET_SIZE})"))
+                }
+
+                if (isReliable && this.connectionState == ConnectionState.RECONNECTING) {
+                    reliableMessageBuffer.queue(DataPacketItem(ByteBuffer.wrap(packetBytes), dataPacket.sequence))
+                    reliableDataSequence++
+                    return Result.success(Unit)
+                }
+                val buf = DataChannel.Buffer(
+                    ByteBuffer.wrap(packetBytes),
+                    true,
+                )
+                val channel = dataChannelForKind(dataPacket.kind)
+                    ?: throw RoomException.ConnectException("channel not established for ${dataPacket.kind.name}")
+
+                if (!channel.send(buf)) {
+                    return Result.failure(
+                        RoomException.ConnectException("failed to send data packet for ${dataPacket.kind.name}"),
+                    )
+                }
+
+                if (isReliable) {
+                    // Wrap a fresh ByteBuffer so the queued item's position stays at 0; the
+                    // ByteBuffer just sent has been drained by DataChannel.send.
+                    reliableMessageBuffer.queue(DataPacketItem(ByteBuffer.wrap(packetBytes), dataPacket.sequence))
+                    reliableDataSequence++
+                }
+            } catch (e: Exception) {
+                e.rethrowIfCancellationSignal()
+                return Result.failure(e)
+            }
+            return Result.success(Unit)
+        }
+
+        if (dataPacket.kind == WibechatModels.DataPacket.Kind.RELIABLE) {
+            synchronized(reliableStateLock) {
+                return sendDataImpl(dataPacket)
+            }
+        } else {
+            return sendDataImpl(dataPacket)
+        }
+    }
+
+    internal suspend fun resendReliableMessagesForResume(lastMessageSeq: Int): Result<Unit> {
+        try {
+            ensurePublisherConnected(WibechatModels.DataPacket.Kind.RELIABLE)
+        } catch (e: Exception) {
+            e.rethrowIfCancellationSignal()
+            return Result.failure(e)
+        }
+        val channel = dataChannelForKind(WibechatModels.DataPacket.Kind.RELIABLE)
+            ?: return Result.failure(NullPointerException("reliable channel not established!"))
+
+        synchronized(reliableStateLock) {
+            reliableMessageBuffer.popToSequence(lastMessageSeq)
+            for (item in reliableMessageBuffer.getAll()) {
+                // Send a duplicate so the underlying buffer keeps position=0 and survives
+                // multiple resume attempts. DataChannel.send drains the buffer's position to
+                // its limit; without duplicate(), the second replay would send empty bytes.
+                if (!channel.send(DataChannel.Buffer(item.data.duplicate(), true))) {
+                    return Result.failure(
+                        RoomException.ConnectException(
+                            "failed to replay reliable data packet at sequence ${item.sequence}",
+                        ),
+                    )
+                }
+            }
+        }
+
+        return Result.success(Unit)
+    }
+
+    internal suspend fun waitForBufferStatusLow(kind: WibechatModels.DataPacket.Kind) {
+        try {
+            ensurePublisherConnected(kind)
+        } catch (e: Exception) {
+            e.rethrowIfCancellationSignal()
+            return
+        }
+        val manager = dataChannelManagerForKind(kind) ?: return
+        manager.waitForBufferedAmountLow(DATA_CHANNEL_LOW_THRESHOLD.toLong())
+    }
+
+    @Throws(exceptionClasses = [RoomException.ConnectException::class])
+    private suspend fun ensurePublisherConnected(kind: WibechatModels.DataPacket.Kind) {
+        if (!isSubscriberPrimary) {
+            return
+        }
+
+        if (publisher == null) {
+            throw RoomException.ConnectException("Publisher isn't setup yet! Is the room connected?")
+        }
+
+        if (publisher?.isConnected() != true &&
+            publisher?.iceConnectionState() != PeerConnection.IceConnectionState.CHECKING
+        ) {
+            // start negotiation
+            this.negotiatePublisher()
+        }
+
+        // Ensure data channel exists
+        dataChannelForKind(kind) ?: throw RoomException.ConnectException("Publisher data channel not established for ${kind.name}; is the room connected?")
+
+        val channelManager = dataChannelManagerForKind(kind)
+            ?: throw RoomException.ConnectException("Publisher data channel manager not established for ${kind.name}; is the room connected?")
+        if (channelManager.state == DataChannel.State.OPEN) {
+            return
+        }
+
+        // wait until publisher ICE connected
+        val endTime = SystemClock.elapsedRealtime() + MAX_ICE_CONNECT_TIMEOUT_MS
+        while (SystemClock.elapsedRealtime() < endTime) {
+            if (publisher?.isConnected() == true &&
+                channelManager.state == DataChannel.State.OPEN
+            ) {
+                return
+            }
+            delay(50)
+        }
+
+        throw RoomException.ConnectException(
+            "could not establish publisher connection: publisher state: ${publisherObserver.connectionState}, channel state: ${channelManager.state}",
+        )
+    }
+
+    /**
+     * Negotiates the publisher if needed and waits until the `_data_track` channel is open.
+     *
+     * Data-track publish must not proceed until then: [sendDataTrackPackets] queues at most one
+     * frame while the channel is not [DataChannel.State.OPEN].
+     *
+     * [DataTrackPublisherChannel] re-reads its manager each pass rather than capturing it, so a
+     * publish in flight when a full reconnect swaps the transport waits for the replacement
+     * channel instead of failing against a disposed one. A real [close] fails it as a disconnect.
+     */
+    @Throws(exceptionClasses = [DataTrackPublishException::class])
+    internal suspend fun ensureDataTrackPublisherConnected() {
+        // Always mark publish intent so a full reconnect's joinImpl renegotiates even if this
+        // wait started against a torn-down publisher transport.
+        if (isSubscriberPrimary) {
+            val publisherTransport = publisher
+            val iceChecking = publisherTransport?.iceConnectionState() ==
+                PeerConnection.IceConnectionState.CHECKING
+            if (publisherTransport?.isConnected() != true && !iceChecking) {
+                negotiatePublisher()
+            }
+        }
+
+        val opened = dataTrackPublisherChannel.awaitOpen(MAX_ICE_CONNECT_TIMEOUT_MS.toLong()) { isClosed }
+        when (opened) {
+            true -> return
+            false -> throw DataTrackPublishException.Disconnected(
+                "Lost the connection while establishing the publisher data track channel",
+            )
+            null -> throw DataTrackPublishException.Timeout(
+                "Timed out establishing the publisher data track channel",
+            )
+        }
+    }
+
+    /**
+     * Creates the publisher `_data_track` channel and hands it to [dataTrackPublisherChannel].
+     */
+    private suspend fun createPublisherDataTrackChannel() {
+        val dataTrackInit = DataChannel.Init()
+        dataTrackInit.ordered = false
+        dataTrackInit.maxRetransmits = 0
+        publisher?.withPeerConnection {
+            createDataChannel(
+                DATA_TRACK_DATA_CHANNEL_LABEL,
+                dataTrackInit,
+            ).also { dataChannel ->
+                val dataChannelManager = DataChannelManager(
+                    dataChannel,
+                    DataChannelObserver(dataChannel),
+                    rtcThreadToken,
+                )
+                dataChannel.registerObserver(dataChannelManager)
+                dataTrackPublisherChannel.attach(dataChannelManager, coroutineScope)
+            }
+        }
+    }
+
+    private fun dataChannelManagerForKind(kind: WibechatModels.DataPacket.Kind): DataChannelManager? =
+        when (kind) {
+            WibechatModels.DataPacket.Kind.RELIABLE -> reliableDataChannelManager
+            WibechatModels.DataPacket.Kind.LOSSY -> lossyDataChannelManager
+            WibechatModels.DataPacket.Kind.UNRECOGNIZED -> throw IllegalArgumentException("Unknown data packet kind!")
+        }
+
+    private fun dataChannelForKind(kind: WibechatModels.DataPacket.Kind) =
+        when (kind) {
+            WibechatModels.DataPacket.Kind.RELIABLE -> reliableDataChannel
+            WibechatModels.DataPacket.Kind.LOSSY -> lossyDataChannel
+            WibechatModels.DataPacket.Kind.UNRECOGNIZED -> throw IllegalArgumentException("Unknown data packet kind!")
+        }
+
+    private fun getPublisherOfferConstraints(): MediaConstraints {
+        return MediaConstraints().apply {
+            with(mandatory) {
+                add(
+                    MediaConstraints.KeyValuePair(
+                        MediaConstraintKeys.OFFER_TO_RECV_AUDIO,
+                        MediaConstraintKeys.FALSE,
+                    ),
+                )
+                add(
+                    MediaConstraints.KeyValuePair(
+                        MediaConstraintKeys.OFFER_TO_RECV_VIDEO,
+                        MediaConstraintKeys.FALSE,
+                    ),
+                )
+                if (connectionState == ConnectionState.RECONNECTING || connectionState == ConnectionState.RESUMING) {
+                    add(
+                        MediaConstraints.KeyValuePair(
+                            MediaConstraintKeys.ICE_RESTART,
+                            MediaConstraintKeys.TRUE,
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    private fun makeRTCConfig(
+        serverResponse: Either<JoinResponse, ReconnectResponse>,
+        connectOptions: ConnectOptions,
+    ): RTCConfiguration {
+        // Convert protobuf ice servers
+        val serverIceServers = run {
+            val servers = mutableListOf<PeerConnection.IceServer>()
+            val responseServers = when (serverResponse) {
+                is Either.Left -> serverResponse.value.iceServersList
+                is Either.Right -> serverResponse.value.iceServersList
+            }
+            for (serverInfo in responseServers) {
+                servers.add(serverInfo.toWebrtc())
+            }
+
+            if (servers.isEmpty()) {
+                servers.addAll(SignalClient.DEFAULT_ICE_SERVERS)
+            }
+            servers
+        }
+
+        val rtcConfig = connectOptions.rtcConfig?.copy()?.apply {
+            val mergedServers = iceServers.toMutableList()
+            connectOptions.iceServers?.forEach { server ->
+                if (!mergedServers.contains(server)) {
+                    mergedServers.add(server)
+                }
+            }
+
+            // Only use server-provided servers if user doesn't provide any.
+            if (mergedServers.isEmpty()) {
+                mergedServers.addAll(serverIceServers)
+            }
+
+            iceServers = mergedServers
+            sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+            continualGatheringPolicy =
+                PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+        }
+            ?: RTCConfiguration(serverIceServers).apply {
+                sdpSemantics = PeerConnection.SdpSemantics.UNIFIED_PLAN
+                continualGatheringPolicy =
+                    PeerConnection.ContinualGatheringPolicy.GATHER_CONTINUALLY
+            }
+
+        // WARP: SNAP (SCTP Negotiation Acceleration Protocol) puts this side's SCTP INIT parameters
+        // into the SDP data m-section, letting a data channel skip SCTP's cookie exchange and saving
+        // up to two round trips on setup. It's negotiated with the server and falls back to plain
+        // SCTP when unsupported, so it's enabled unconditionally, even over a user-provided config.
+        rtcConfig.enableSctpSnap = true
+
+        val clientConfig = when (serverResponse) {
+            is Either.Left -> {
+                if (serverResponse.value.hasClientConfiguration()) {
+                    serverResponse.value.clientConfiguration
+                } else {
+                    null
+                }
+            }
+
+            is Either.Right -> {
+                if (serverResponse.value.hasClientConfiguration()) {
+                    serverResponse.value.clientConfiguration
+                } else {
+                    null
+                }
+            }
+        }
+        if (clientConfig != null) {
+            if (clientConfig.forceRelay == WibechatModels.ClientConfigSetting.ENABLED) {
+                rtcConfig.iceTransportsType = PeerConnection.IceTransportsType.RELAY
+            }
+        }
+
+        return rtcConfig
+    }
+
+    internal interface Listener {
+        fun onEngineConnected()
+        fun onEngineReconnected()
+        fun onEngineReconnecting()
+        fun onEngineResuming() {}
+        fun onEngineResumed() {}
+        fun onEngineDisconnected(reason: DisconnectReason)
+        fun onFailToConnect(error: Throwable)
+        fun onJoinResponse(response: JoinResponse)
+        fun reattachRemoteDataTracks() {}
+        fun onAddTrack(receiver: RtpReceiver, track: MediaStreamTrack, streams: Array<out MediaStream>)
+        fun onUpdateParticipants(updates: List<WibechatModels.ParticipantInfo>)
+        fun onActiveSpeakersUpdate(speakers: List<WibechatModels.SpeakerInfo>)
+        fun onRemoteMuteChanged(trackSid: String, muted: Boolean)
+        fun onRoomUpdate(update: WibechatModels.Room)
+        fun onConnectionQuality(updates: List<WibechatRtc.ConnectionQualityInfo>)
+        fun onSpeakersChanged(speakers: List<WibechatModels.SpeakerInfo>)
+        fun onUserPacket(packet: WibechatModels.UserPacket, kind: WibechatModels.DataPacket.Kind, encryptionType: WibechatModels.Encryption.Type)
+        fun onStreamStateUpdate(streamStates: List<WibechatRtc.StreamStateInfo>)
+        fun onSubscribedQualityUpdate(subscribedQualityUpdate: WibechatRtc.SubscribedQualityUpdate)
+        fun onSubscriptionPermissionUpdate(subscriptionPermissionUpdate: WibechatRtc.SubscriptionPermissionUpdate)
+        fun onSubscriptionError(subscriptionResponse: WibechatRtc.SubscriptionResponse)
+        suspend fun onSignalConnected(isResume: Boolean)
+        fun onFullReconnecting()
+        suspend fun onPostReconnect(isFullReconnect: Boolean)
+        fun onLocalTrackUnpublished(trackUnpublished: WibechatRtc.TrackUnpublishedResponse)
+        fun onTranscriptionReceived(transcription: WibechatModels.Transcription)
+        fun onLocalTrackSubscribed(trackSubscribed: WibechatRtc.TrackSubscribed)
+        fun onRpcPacketReceived(dp: WibechatModels.DataPacket)
+        fun onDataStreamPacket(dp: WibechatModels.DataPacket, encryptionType: WibechatModels.Encryption.Type)
+    }
+
+    companion object {
+
+        /**
+         * @suppress
+         */
+        @VisibleForTesting
+        const val RELIABLE_DATA_CHANNEL_LABEL = "_reliable"
+
+        /**
+         * @suppress
+         */
+        @VisibleForTesting
+        const val LOSSY_DATA_CHANNEL_LABEL = "_lossy"
+
+        /**
+         * Dedicated data channel for WibeChat data-track packets.
+         *
+         * @suppress
+         */
+        @VisibleForTesting
+        const val DATA_TRACK_DATA_CHANNEL_LABEL = "_data_track"
+
+        internal const val TARGET_DATA_PACKET_SIZE = 15 * 1024 // 15 KB
+
+        /**
+         * Corresponds to the max-message-size in SDP. Attempting to send packets
+         * over this size will cause the data channel to close, so this must be enforced
+         * within the SDK. Note that [DataChannel.send] will still report true
+         * even if a huge packet is sent, so it's not a usable signal.
+         *
+         * TODO: get max-message-size from SDP or equivalent from libwebrtc.
+         */
+        internal const val MAX_DATA_PACKET_SIZE = 64 * 1024 - 1 // 64 KB
+        private const val MAX_RECONNECT_RETRIES = 30
+        private const val MAX_RECONNECT_TIMEOUT = 60 * 1000
+        private const val MAX_ICE_CONNECT_TIMEOUT_MS = 20000
+
+        private const val DATA_CHANNEL_LOW_THRESHOLD = 2 * 1024 * 1024 // 2 MB
+
+        private val RELIABLE_RECEIVE_STATE_TTL_MS = 30.seconds
+        private val RELIABLE_RETRY_AMOUNT = (DATA_CHANNEL_LOW_THRESHOLD * 1.25).toLong()
+
+        internal val CONN_CONSTRAINTS = MediaConstraints().apply {
+            with(optional) {
+                add(MediaConstraints.KeyValuePair("DtlsSrtpKeyAgreement", "true"))
+            }
+        }
+    }
+
+    // ---------------------------------- SignalClient.Listener --------------------------------------//
+
+    override fun onServerAnswer(sessionDescription: SessionDescription, offerId: Int) {
+        WCLog.v { "received server answer: ${sessionDescription.type}, ${runBlocking { publisher?.signalingState() }}" }
+        coroutineScope.launch {
+            when (val outcome = publisher?.setRemoteDescription(sessionDescription, offerId).nullSafe()) {
+                is Either.Left -> {
+                    // do nothing.
+                }
+
+                is Either.Right -> {
+                    WCLog.e { "error setting remote description for answer: ${outcome.value} " }
+                }
+            }
+        }
+    }
+
+    override fun onServerOffer(sessionDescription: SessionDescription, offerId: Int) {
+        WCLog.v { "received server offer: ${sessionDescription.type}, ${runBlocking { publisher?.signalingState() }}" }
+        coroutineScope.launch {
+            run {
+                when (val outcome = subscriber?.setRemoteDescription(sessionDescription, offerId).nullSafe()) {
+                    is Either.Right -> {
+                        WCLog.e { "error setting remote description for offer: ${outcome.value} " }
+                        return@launch
+                    }
+
+                    else -> {}
+                }
+            }
+
+            if (isClosed) {
+                return@launch
+            }
+
+            val answer = run {
+                when (val outcome = subscriber?.withPeerConnection { createAnswer(MediaConstraints()) }.nullSafe()) {
+                    is Either.Left -> outcome.value
+                    is Either.Right -> {
+                        WCLog.e { "error creating answer: ${outcome.value}" }
+                        return@launch
+                    }
+                }
+            }
+
+            if (isClosed) {
+                return@launch
+            }
+
+            run<Unit> {
+                when (val outcome = subscriber?.withPeerConnection { setLocalDescription(answer) }.nullSafe()) {
+                    is Either.Left -> Unit
+                    is Either.Right -> {
+                        WCLog.e { "error setting local description for answer: ${outcome.value}" }
+                        return@launch
+                    }
+                }
+            }
+
+            if (isClosed) {
+                return@launch
+            }
+            client.sendAnswer(answer, offerId)
+        }
+    }
+
+    override fun onTrickle(candidate: IceCandidate, target: WibechatRtc.SignalTarget) {
+        WCLog.v { "received ice candidate from peer: $candidate, $target" }
+        when (target) {
+            WibechatRtc.SignalTarget.PUBLISHER -> {
+                publisher?.addIceCandidate(candidate)
+                    ?: WCLog.w { "received candidate for publisher when we don't have one. ignoring." }
+            }
+
+            WibechatRtc.SignalTarget.SUBSCRIBER -> {
+                subscriber?.addIceCandidate(candidate)
+                    ?: WCLog.w { "received candidate for subscriber when we don't have one. ignoring." }
+            }
+
+            else -> WCLog.i { "unknown ice candidate target?" }
+        }
+    }
+
+    override fun onLocalTrackPublished(response: WibechatRtc.TrackPublishedResponse) {
+        val cid = response.cid ?: run {
+            WCLog.e { "local track published with null cid?" }
+            return
+        }
+
+        val track = response.track
+        if (track == null) {
+            WCLog.d { "local track published with null track info?" }
+        }
+
+        WCLog.v { "local track published $cid" }
+        val cont = synchronized(pendingTrackResolvers) {
+            pendingTrackResolvers.remove(cid)
+        }
+        if (cont == null) {
+            WCLog.d { "missing track resolver for: $cid" }
+            return
+        }
+        cont.resume(response.track)
+    }
+
+    override fun onLocalTrackSubscribed(trackSubscribed: WibechatRtc.TrackSubscribed) {
+        listener?.onLocalTrackSubscribed(trackSubscribed)
+    }
+
+    override fun onParticipantUpdate(updates: List<WibechatModels.ParticipantInfo>, encoded: ByteArray) {
+        listener?.onUpdateParticipants(updates)
+        val identity = localParticipantIdentity
+        if (identity != null) {
+            incomingDataTrackManager.handleSfuParticipantUpdate(encoded, identity)
+        }
+        listener?.reattachRemoteDataTracks()
+    }
+
+    override fun onSpeakersChanged(speakers: List<WibechatModels.SpeakerInfo>) {
+        listener?.onSpeakersChanged(speakers)
+    }
+
+    override fun onClose(reason: String, code: Int) {
+        WCLog.i { "received close event: $reason, code: $code" }
+        endSignalSession()
+        abortPendingPublishTracks()
+        reconnect()
+    }
+
+    override fun onRemoteMuteChanged(trackSid: String, muted: Boolean) {
+        listener?.onRemoteMuteChanged(trackSid, muted)
+    }
+
+    override fun onRoomUpdate(update: WibechatModels.Room) {
+        listener?.onRoomUpdate(update)
+    }
+
+    override fun onConnectionQuality(updates: List<WibechatRtc.ConnectionQualityInfo>) {
+        listener?.onConnectionQuality(updates)
+    }
+
+    override fun onLeave(leave: LeaveRequest) {
+        WCLog.d { "leave request received: reason = ${leave.reason.name}" }
+
+        endSignalSession()
+        abortPendingPublishTracks()
+
+        if (leave.hasRegions()) {
+            regionUrlProvider?.setServerReportedRegions(RegionSettings.fromProto(leave.regions))
+        }
+
+        when {
+            leave.action == LeaveRequest.Action.RESUME -> {
+                // resume will be triggered on close.
+                // TODO: trigger immediately.
+                fullReconnectOnNext = false
+            }
+
+            leave.action == LeaveRequest.Action.RECONNECT ||
+                // canReconnect is deprecated protocol version >= 13
+                leave.canReconnect -> {
+                // resume will be triggered on close.
+                // TODO: trigger immediately.
+                fullReconnectOnNext = true
+            }
+
+            else -> {
+                close()
+                val disconnectReason = leave.reason.convert()
+                listener?.onEngineDisconnected(disconnectReason)
+            }
+        }
+    }
+
+    // Signal error
+    override fun onError(error: Throwable) {
+        if (connectionState == ConnectionState.CONNECTING) {
+            listener?.onFailToConnect(error)
+        }
+    }
+
+    override fun onStreamStateUpdate(streamStates: List<WibechatRtc.StreamStateInfo>) {
+        listener?.onStreamStateUpdate(streamStates)
+    }
+
+    override fun onSubscribedQualityUpdate(subscribedQualityUpdate: WibechatRtc.SubscribedQualityUpdate) {
+        listener?.onSubscribedQualityUpdate(subscribedQualityUpdate)
+    }
+
+    override fun onSubscriptionPermissionUpdate(subscriptionPermissionUpdate: WibechatRtc.SubscriptionPermissionUpdate) {
+        listener?.onSubscriptionPermissionUpdate(subscriptionPermissionUpdate)
+    }
+
+    override fun onSubscriptionError(subscriptionResponse: WibechatRtc.SubscriptionResponse) {
+        listener?.onSubscriptionError(subscriptionResponse)
+    }
+
+    override fun onRefreshToken(token: String) {
+        sessionToken = token
+        regionUrlProvider?.token = token
+    }
+
+    override fun onLocalTrackUnpublished(trackUnpublished: WibechatRtc.TrackUnpublishedResponse) {
+        listener?.onLocalTrackUnpublished(trackUnpublished)
+    }
+
+    override fun onPublishDataTrackResponse(encoded: ByteArray) {
+        outgoingDataTrackManager.handleSfuPublishResponse(encoded)
+    }
+
+    override fun onUnpublishDataTrackResponse(encoded: ByteArray) {
+        outgoingDataTrackManager.handleSfuUnpublishResponse(encoded)
+    }
+
+    override fun onRequestResponse(encoded: ByteArray) {
+        outgoingDataTrackManager.handleSfuRequestResponse(encoded)
+    }
+
+    override fun onDataTrackSubscriberHandles(encoded: ByteArray) {
+        incomingDataTrackManager.handleSubscriberHandles(encoded)
+    }
+
+    /**
+     * Forwards an encoded [WibechatRtc.SignalRequest] produced by a UniFFI data track manager.
+     */
+    internal fun sendDataTrackSignalRequest(requestBytes: ByteArray) {
+        // Data-track publish / subscribe signaling requires the publisher PC / `_data_track` DC.
+        if (!hasPublished) {
+            negotiatePublisher()
+        }
+        client.sendEncodedRequest(requestBytes)
+    }
+
+    /**
+     * Queues serialized data-track packets on the dedicated `_data_track` data channel.
+     */
+    internal fun sendDataTrackPackets(packets: List<ByteArray>) {
+        dataTrackPublisherChannel.sendPackets(packets)
+    }
+
+    // --------------------------------- DataChannel.Observer ------------------------------------//
+
+    fun onBufferedAmountChange(dataChannel: DataChannel, previousAmount: Long) {
+    }
+
+    fun onStateChange(dataChannel: DataChannel) {
+    }
+
+    fun onMessage(dataChannel: DataChannel, buffer: DataChannel.Buffer?) {
+        if (buffer == null) {
+            return
+        }
+        if (dataChannel.label() == DATA_TRACK_DATA_CHANNEL_LABEL) {
+            incomingDataTrackManager.handlePacketReceived(ByteString.copyFrom(buffer.data).toByteArray())
+            return
+        }
+        var dp = WibechatModels.DataPacket.parseFrom(ByteString.copyFrom(buffer.data))
+
+        if (dp.sequence > 0 && dp.participantSid.isNotEmpty()) {
+            synchronized(reliableStateLock) {
+                val lastSeq = reliableReceivedState[dp.participantSid]
+                if (lastSeq != null && dp.sequence <= lastSeq) {
+                    // ignore duplicate or out-of-order packets in reliable channel
+                    return
+                }
+                this.reliableReceivedState[dp.participantSid] = dp.sequence
+            }
+        }
+
+        // Always decrypt if able, to allow for backward compatibility.
+        val dataPacketCryptor = dataPacketCryptorManager
+        var encryptionType = WibechatModels.Encryption.Type.NONE
+        if (dp.hasEncryptedPacket() && dataPacketCryptor != null) {
+            val encryptedPacket = EncryptedPacket(
+                dp.encryptedPacket.encryptedValue.toByteArray(),
+                dp.encryptedPacket.iv.toByteArray(),
+                dp.encryptedPacket.keyIndex,
+            )
+            encryptionType = dp.encryptedPacket.encryptionType
+
+            val decryptedData = dataPacketCryptor.decrypt(Participant.Identity(dp.participantIdentity), encryptedPacket)
+            if (decryptedData == null) {
+                WCLog.i { "Failed to decrypt data packet." }
+                return
+            }
+            val payload = WibechatModels.EncryptedPacketPayload.parseFrom(decryptedData)
+
+            dp = with(dp.toBuilder()) {
+                setFromEncryptedPayload(payload)
+                build()
+            }
+        }
+
+        when (dp.valueCase) {
+            WibechatModels.DataPacket.ValueCase.SPEAKER -> {
+                listener?.onActiveSpeakersUpdate(dp.speaker.speakersList)
+            }
+
+            WibechatModels.DataPacket.ValueCase.USER -> {
+                listener?.onUserPacket(dp.user, dp.kind, encryptionType)
+            }
+
+            WibechatModels.DataPacket.ValueCase.SIP_DTMF -> {
+                // TODO
+            }
+
+            WibechatModels.DataPacket.ValueCase.TRANSCRIPTION -> {
+                listener?.onTranscriptionReceived(dp.transcription)
+            }
+
+            WibechatModels.DataPacket.ValueCase.METRICS -> {
+                // TODO
+            }
+
+            WibechatModels.DataPacket.ValueCase.CHAT_MESSAGE -> {
+                // TODO
+            }
+
+            WibechatModels.DataPacket.ValueCase.RPC_REQUEST,
+            WibechatModels.DataPacket.ValueCase.RPC_ACK,
+            WibechatModels.DataPacket.ValueCase.RPC_RESPONSE,
+            -> {
+                listener?.onRpcPacketReceived(dp)
+            }
+
+            WibechatModels.DataPacket.ValueCase.STREAM_HEADER,
+            WibechatModels.DataPacket.ValueCase.STREAM_CHUNK,
+            WibechatModels.DataPacket.ValueCase.STREAM_TRAILER,
+            -> {
+                listener?.onDataStreamPacket(dp, encryptionType)
+            }
+
+            WibechatModels.DataPacket.ValueCase.ENCRYPTED_PACKET -> {
+                // should be handled above.
+            }
+
+            WibechatModels.DataPacket.ValueCase.VALUE_NOT_SET,
+            null,
+            -> {
+                WCLog.v { "invalid value for data packet" }
+            }
+        }
+    }
+
+    private inner class DataChannelObserver(val dataChannel: DataChannel) : DataChannel.Observer {
+        override fun onBufferedAmountChange(p0: Long) {
+            this@RTCEngine.onBufferedAmountChange(dataChannel, p0)
+        }
+
+        override fun onStateChange() {
+            this@RTCEngine.onStateChange(dataChannel)
+        }
+
+        override fun onMessage(p0: DataChannel.Buffer) {
+            this@RTCEngine.onMessage(dataChannel, p0)
+        }
+    }
+
+    suspend fun sendSyncState(
+        subscription: WibechatRtc.UpdateSubscription,
+        publishedTracks: List<WibechatRtc.TrackPublishedResponse>,
+    ) {
+        var answer: WibechatRtc.SessionDescription? = null
+        var offer: WibechatRtc.SessionDescription? = null
+        runBlocking {
+            subscriber?.withPeerConnection {
+                answer = localDescription?.toProtoSessionDescription()
+                offer = remoteDescription?.toProtoSessionDescription()
+            }
+        }
+
+        val dataChannelInfos = WibechatModels.DataPacket.Kind.entries
+            .filterNot { it == WibechatModels.DataPacket.Kind.UNRECOGNIZED }
+            .mapNotNull { kind -> dataChannelForKind(kind) }
+            .map { dataChannel ->
+                WibechatRtc.DataChannelInfo.newBuilder()
+                    .setId(dataChannel.id())
+                    .setLabel(dataChannel.label())
+                    .build()
+            }
+
+        val dataChannelReceiveStates = synchronized(reliableStateLock) {
+            this.reliableReceivedState.map { (participantSid, sequence) ->
+                with(WibechatRtc.DataChannelReceiveState.newBuilder()) {
+                    publisherSid = participantSid
+                    lastSeq = sequence
+                    build()
+                }
+            }
+        }
+
+        val publishDataTracks = outgoingDataTrackManager.publishResponsesForSyncState().mapNotNull { bytes ->
+            try {
+                WibechatRtc.PublishDataTrackResponse.parseFrom(bytes)
+            } catch (e: Exception) {
+                e.rethrowIfCancellationSignal()
+                WCLog.w(e) { "Failed to parse PublishDataTrackResponse for sync state" }
+                null
+            }
+        }
+
+        val syncState = with(WibechatRtc.SyncState.newBuilder()) {
+            if (answer != null) {
+                setAnswer(answer)
+            }
+            if (offer != null) {
+                setOffer(offer)
+            }
+            setSubscription(subscription)
+            addAllPublishTracks(publishedTracks)
+            addAllPublishDataTracks(publishDataTracks)
+            addAllDataChannels(dataChannelInfos)
+            addAllDatachannelReceiveStates(dataChannelReceiveStates)
+            build()
+        }
+
+        client.sendSyncState(syncState)
+    }
+
+    fun getPublisherRTCStats(callback: RTCStatsCollectorCallback) {
+        runBlocking {
+            publisher?.withPeerConnection { getStats(callback) }
+                ?: callback.onStatsDelivered(RTCStatsReport(0, emptyMap()))
+        }
+    }
+
+    fun getSubscriberRTCStats(callback: RTCStatsCollectorCallback) {
+        runBlocking {
+            subscriber?.withPeerConnection { getStats(callback) }
+                ?: callback.onStatsDelivered(RTCStatsReport(0, emptyMap()))
+        }
+    }
+
+    fun createStatsGetter(sender: RtpSender): RTCStatsGetter {
+        val p = publisher
+        return { statsCallback: RTCStatsCollectorCallback ->
+            runBlocking {
+                p?.withPeerConnection {
+                    getStats(sender, statsCallback)
+                } ?: statsCallback.onStatsDelivered(RTCStatsReport(0, emptyMap()))
+            }
+        }
+    }
+
+    fun createStatsGetter(receiver: RtpReceiver): RTCStatsGetter {
+        val p = subscriber
+        return { statsCallback: RTCStatsCollectorCallback ->
+            runBlocking {
+                p?.withPeerConnection {
+                    getStats(receiver, statsCallback)
+                } ?: statsCallback.onStatsDelivered(RTCStatsReport(0, emptyMap()))
+            }
+        }
+    }
+
+    internal fun registerTrackBitrateInfo(cid: String, trackBitrateInfo: TrackBitrateInfo) {
+        publisher?.registerTrackBitrateInfo(cid, trackBitrateInfo)
+    }
+
+    internal fun removeTrack(rtcTrack: MediaStreamTrack) {
+        runBlocking {
+            publisher?.withPeerConnection {
+                val senders = this.senders
+                for (sender in senders) {
+                    val t = sender.track() ?: continue
+                    if (t.id() == rtcTrack.id()) {
+                        this@withPeerConnection.removeTrack(sender)
+                    }
+                }
+            }
+        }
+    }
+
+    internal fun stopTransceivers(transceivers: List<RtpTransceiver>) {
+        if (transceivers.isEmpty()) {
+            return
+        }
+        runBlocking {
+            publisher?.withPeerConnection {
+                for (transceiver in transceivers) {
+                    if (!transceiver.isStopped) {
+                        transceiver.stopInternal()
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Detaches a sender transceiver whose publish attempt produced no publication.
+     *
+     * A publish fails most often because the signal connection died, and that same failure
+     * starts a reconnect which renegotiates this peer connection. Mutating its senders and
+     * transceivers alongside that negotiation races it, so the rollback is skipped unless the
+     * publisher is connected and idle. The sender retains its signal session state so an aborted
+     * publish cannot mutate the same publisher after a soft reconnect.
+     *
+     * @param stopTransceiver releases the transceiver and its SDP m-section for reuse. Reserved
+     * for video, matching the teardown an unpublish performs.
+     * @return whether the sender was detached, so the track can drop its reference to it.
+     */
+    internal fun rollbackSenderTransceiver(
+        senderTransceiver: SenderTransceiverHandle,
+        stopTransceiver: Boolean,
+    ): Boolean {
+        val publisher = senderTransceiver.publisher
+        return runBlocking {
+            publisher.withPeerConnection {
+                val sessionState = signalSessionState
+                val publisherIsIdle = this@RTCEngine.publisher === publisher &&
+                    connectionState == ConnectionState.CONNECTED &&
+                    reconnectingJob?.isActive != true &&
+                    senderTransceiver.signalSessionState === sessionState &&
+                    !sessionState.ended
+                if (!publisherIsIdle) {
+                    return@withPeerConnection false
+                }
+                val transceiver = senderTransceiver.transceiver
+                removeTrack(transceiver.sender)
+                if (stopTransceiver && !transceiver.isStopped) {
+                    transceiver.stopInternal()
+                }
+                true
+            } ?: false
+        }
+    }
+
+    @VisibleForTesting
+    fun getPublisherPeerConnection() =
+        publisher!!.peerConnection
+
+    @VisibleForTesting
+    fun getSubscriberPeerConnection() =
+        subscriber!!.peerConnection
+}
+
+/**
+ * Identity of one signal session, replaced at every session boundary.
+ *
+ * [ended] distinguishes a session that is finishing from one that is serving, for work that
+ * starts after the boundary and would otherwise match the current identity.
+ */
+internal class SignalSessionState(
+    val ended: Boolean,
+)
+
+internal class SenderTransceiverHandle(
+    internal val publisher: PeerConnectionTransport,
+    internal val transceiver: RtpTransceiver,
+    internal val signalSessionState: SignalSessionState,
+)
+
+/**
+ * @suppress
+ */
+enum class ReconnectType {
+    DEFAULT,
+    FORCE_SOFT_RECONNECT,
+    FORCE_FULL_RECONNECT,
+}
+
+/**
+ * @suppress
+ */
+fun WibechatRtc.ICEServer.toWebrtc(): PeerConnection.IceServer = PeerConnection.IceServer.builder(urlsList)
+    .setUsername(username ?: "")
+    .setPassword(credential ?: "")
+    .setTlsAlpnProtocols(emptyList())
+    .setTlsEllipticCurves(emptyList())
+    .createIceServer()
+
+typealias PeerConnectionStateListener = (PeerConnectionState) -> Unit
+
+internal fun WibechatModels.DataPacket.asEncryptedPacketPayload(): WibechatModels.EncryptedPacketPayload? {
+    return when (valueCase) {
+        WibechatModels.DataPacket.ValueCase.USER -> {
+            WibechatModels.EncryptedPacketPayload.newBuilder()
+                .setUser(this.user)
+                .build()
+        }
+
+        WibechatModels.DataPacket.ValueCase.RPC_REQUEST -> {
+            WibechatModels.EncryptedPacketPayload.newBuilder()
+                .setRpcRequest(this.rpcRequest)
+                .build()
+        }
+
+        WibechatModels.DataPacket.ValueCase.RPC_ACK -> {
+            WibechatModels.EncryptedPacketPayload.newBuilder()
+                .setRpcAck(this.rpcAck)
+                .build()
+        }
+
+        WibechatModels.DataPacket.ValueCase.RPC_RESPONSE -> {
+            WibechatModels.EncryptedPacketPayload.newBuilder()
+                .setRpcResponse(this.rpcResponse)
+                .build()
+        }
+
+        WibechatModels.DataPacket.ValueCase.STREAM_HEADER -> {
+            WibechatModels.EncryptedPacketPayload.newBuilder()
+                .setStreamHeader(this.streamHeader)
+                .build()
+        }
+
+        WibechatModels.DataPacket.ValueCase.STREAM_CHUNK -> {
+            WibechatModels.EncryptedPacketPayload.newBuilder()
+                .setStreamChunk(this.streamChunk)
+                .build()
+        }
+
+        WibechatModels.DataPacket.ValueCase.STREAM_TRAILER -> {
+            WibechatModels.EncryptedPacketPayload.newBuilder()
+                .setStreamTrailer(this.streamTrailer)
+                .build()
+        }
+
+        WibechatModels.DataPacket.ValueCase.CHAT_MESSAGE -> {
+            WibechatModels.EncryptedPacketPayload.newBuilder()
+                .setChatMessage(this.chatMessage)
+                .build()
+        }
+
+        WibechatModels.DataPacket.ValueCase.METRICS,
+        WibechatModels.DataPacket.ValueCase.SIP_DTMF,
+        WibechatModels.DataPacket.ValueCase.SPEAKER,
+        WibechatModels.DataPacket.ValueCase.ENCRYPTED_PACKET,
+        WibechatModels.DataPacket.ValueCase.TRANSCRIPTION,
+        WibechatModels.DataPacket.ValueCase.VALUE_NOT_SET,
+        -> {
+            null
+        }
+    }
+}
+
+internal fun WibechatModels.DataPacket.Builder.setFromEncryptedPayload(payload: WibechatModels.EncryptedPacketPayload) {
+    when (payload.valueCase) {
+        WibechatModels.EncryptedPacketPayload.ValueCase.USER -> {
+            this.user = payload.user
+        }
+
+        WibechatModels.EncryptedPacketPayload.ValueCase.CHAT_MESSAGE -> {
+            this.chatMessage = payload.chatMessage
+        }
+
+        WibechatModels.EncryptedPacketPayload.ValueCase.RPC_REQUEST -> {
+            this.rpcRequest = payload.rpcRequest
+        }
+
+        WibechatModels.EncryptedPacketPayload.ValueCase.RPC_ACK -> {
+            this.rpcAck = payload.rpcAck
+        }
+
+        WibechatModels.EncryptedPacketPayload.ValueCase.RPC_RESPONSE -> {
+            this.rpcResponse = payload.rpcResponse
+        }
+
+        WibechatModels.EncryptedPacketPayload.ValueCase.STREAM_HEADER -> {
+            this.streamHeader = payload.streamHeader
+        }
+
+        WibechatModels.EncryptedPacketPayload.ValueCase.STREAM_CHUNK -> {
+            this.streamChunk = payload.streamChunk
+        }
+
+        WibechatModels.EncryptedPacketPayload.ValueCase.STREAM_TRAILER -> {
+            this.streamTrailer = payload.streamTrailer
+        }
+
+        WibechatModels.EncryptedPacketPayload.ValueCase.VALUE_NOT_SET -> {
+            // decryption likely failed
+            WCLog.w { "Attempting to set from non-valid payload" }
+        }
+    }
+}

@@ -10,7 +10,7 @@ plugins {
 }
 
 android {
-    namespace 'io.wibechat.android'
+    namespace 'com.wibechat.android'
     compileSdkVersion androidSdk.compileVersion
 
     defaultConfig {
@@ -49,7 +49,7 @@ android {
         buildConfig = true
     }
     kotlinOptions {
-        freeCompilerArgs = ["-Xinline-classes", "-opt-in=kotlin.RequiresOptIn", "-opt-in=io.wibechat.android.annotations.Beta"]
+        freeCompilerArgs = ["-Xinline-classes", "-opt-in=kotlin.RequiresOptIn", "-opt-in=com.wibechat.android.annotations.Beta"]
         jvmTarget = java_version
     }
 

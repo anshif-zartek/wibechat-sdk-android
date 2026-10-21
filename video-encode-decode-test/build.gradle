@@ -21,11 +21,11 @@ final apiKey = getApiKey()
 final apiSecret = getApiSecret()
 
 android {
-    namespace "io.wibechat.android.videoencodedecode"
+    namespace "com.wibechat.android.videoencodedecode"
     compileSdkVersion androidSdk.compileVersion
 
     defaultConfig {
-        applicationId "io.wibechat.android.videoencodedecode"
+        applicationId "com.wibechat.android.videoencodedecode"
         minSdkVersion androidSdk.minVersion
         targetSdkVersion androidSdk.targetVersion
         versionCode 1

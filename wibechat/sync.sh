@@ -1,26 +1,30 @@
 #!/usr/bin/env bash
 #
-# Fast-forwards main to upstream, regenerates the rebranded branch from it
-# (carrying this tooling along), verifies that it builds, and pushes both.
+# Fast-forwards main to upstream, regenerates the rebranded branch from the
+# newest upstream release (carrying this tooling along), verifies that it
+# builds, and pushes both, tagging new versions for release.
 # main is never committed to; it stays an exact mirror of upstream.
 #
-# Usage: ./sync.sh [--no-push] [--skip-build] [--yes]
+# Usage: ./sync.sh [--no-push] [--skip-build] [--no-tag] [--yes]
 #   --no-push     Generate and build only. Pushes nothing, moves no local branch,
 #                 and keeps the generated tree for inspection.
 #   --skip-build  Skip the ./gradlew assembleDebug check of the generated tree.
+#   --no-tag      Do not push a release tag for a new upstream version.
 #   --yes         Push without asking for confirmation.
 
 set -euo pipefail
 
 PUSH=1
 BUILD=1
+TAG=1
 ASSUME_YES=0
 for arg in "$@"; do
   case "$arg" in
     --no-push) PUSH=0 ;;
+    --no-tag) TAG=0 ;;
     --skip-build) BUILD=0 ;;
     --yes) ASSUME_YES=1 ;;
-    -h|--help) sed -n '3,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '3,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown option: $arg" >&2; exit 2 ;;
   esac
 done
@@ -75,10 +79,6 @@ move_local_branch() {
   wt="$(worktree_of "$branch")"
   if [[ -z "$wt" ]]; then
     g update-ref "refs/heads/$branch" "$target"
-  elif git -C "$wt" diff --quiet "$target" --; then
-    # The checkout already matches the target, e.g. uncommitted tooling edits that
-    # this sync just committed. Move the branch without touching the files.
-    git -C "$wt" reset --quiet --mixed "$target"
   elif git -C "$wt" merge-base --is-ancestor HEAD "$target"; then
     git -C "$wt" merge --ff-only --quiet "$target" \
       || warn "could not fast-forward $branch in $wt; run 'git merge --ff-only origin/$branch' there."
@@ -88,12 +88,29 @@ move_local_branch() {
   fi
 }
 
+# Clears what would block moving this checkout onto the generated commit: the
+# local tooling (already copied into that commit) and the protocol submodule
+# checkout (replaced by vendored files).
+release_checkout_for_rebrand() {
+  if [[ "$(worktree_of "$REBRAND_BRANCH")" != "$REPO" ]]; then
+    return
+  fi
+  g checkout --quiet HEAD -- sync.sh "$TOOLS_DIR_NAME" 2>/dev/null || true
+  g clean --quiet -fd -- sync.sh "$TOOLS_DIR_NAME"
+  if [[ -e "$REPO/protocol/.git" ]]; then
+    g submodule deinit --quiet --force protocol
+    rm -rf "$REPO/protocol"
+  fi
+}
+
 step "Fetching origin and upstream"
 if ! g remote get-url upstream >/dev/null 2>&1; then
   g remote add upstream "$UPSTREAM_URL"
 fi
+# Upstream tags share names with ours (v2.29.1), so keep them in their own namespace.
+g config remote.upstream.tagOpt --no-tags
 g fetch --quiet origin
-g fetch --quiet upstream "$UPSTREAM_BRANCH"
+g fetch --quiet --no-tags upstream "$UPSTREAM_BRANCH" "+refs/tags/v*:refs/upstream-tags/v*"
 upstream_head="$(g rev-parse "refs/remotes/upstream/$UPSTREAM_BRANCH")"
 
 step "Fast-forwarding $MAIN_BRANCH to upstream/$UPSTREAM_BRANCH"
@@ -111,13 +128,24 @@ else
   echo "Fast-forwarding to ${new_main:0:10}."
 fi
 
-step "Exporting $MAIN_BRANCH with vendored protocol files"
+if [[ "$SYNC_FROM" == "release" ]]; then
+  upstream_release="$(g for-each-ref --format='%(refname:lstrip=2)' refs/upstream-tags/ \
+    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)"
+  [[ -n "$upstream_release" ]] || die "no upstream vX.Y.Z release tags found."
+  source_sha="$(g rev-parse "refs/upstream-tags/$upstream_release^{commit}")"
+  source_label="upstream release $upstream_release"
+else
+  source_sha="$new_main"
+  source_label="upstream/$UPSTREAM_BRANCH"
+fi
+
+step "Exporting $source_label with vendored protocol files"
 TREE="$WORK/tree"
 mkdir -p "$TREE"
-g archive "$new_main" | tar -x -C "$TREE"
+g archive "$source_sha" | tar -x -C "$TREE"
 
-proto_sha="$(g ls-tree "$new_main" protocol | awk '$2 == "commit" { print $3 }')"
-[[ -n "$proto_sha" ]] || die "no protocol submodule found in $MAIN_BRANCH."
+proto_sha="$(g ls-tree "$source_sha" protocol | awk '$2 == "commit" { print $3 }')"
+[[ -n "$proto_sha" ]] || die "no protocol submodule found in $source_label."
 proto_cache="$(cd "$REPO" && cd "$(git rev-parse --git-common-dir)" && pwd)/wibechat-protocol.git"
 if [[ ! -d "$proto_cache" ]]; then
   git clone --quiet --bare "$PROTOCOL_URL" "$proto_cache"
@@ -157,14 +185,22 @@ if [[ -n "$prev_rebrand" ]] && g log -1 --format=%B "$prev_rebrand" | grep -q '^
     echo "Generated tree is unchanged since the last sync."
   else
     new_rebrand="$(g commit-tree "$tree_sha" -p "$prev_rebrand" \
-      -m "Sync to v$version" -m "Synced-From: $new_main")"
+      -m "Sync to v$version" -m "Synced-From: $source_sha")"
   fi
 else
   orphan=1
   new_rebrand="$(g commit-tree "$tree_sha" \
-    -m "Sync to v$version" -m "Synced-From: $new_main")"
+    -m "Sync to v$version" -m "Synced-From: $source_sha")"
 fi
 echo "Generated commit: $new_rebrand"
+
+# A new upstream version gets a release tag; pushing it publishes to Maven Central.
+release_tag=""
+if [[ "$TAG" == 1 && "$version" != *SNAPSHOT* ]] \
+    && ! g ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null; then
+  release_tag="v$version"
+  echo "Release tag to create: $release_tag"
+fi
 
 if [[ "$BUILD" == 1 ]]; then
   step "Building generated tree (./gradlew assembleDebug)"
@@ -189,6 +225,9 @@ fi
 step "Ready to push"
 echo "  $MAIN_BRANCH:        ${origin_main:0:10} -> ${new_main:0:10}"
 echo "  $REBRAND_BRANCH: ${prev_rebrand:0:10} -> ${new_rebrand:0:10}"
+if [[ -n "$release_tag" ]]; then
+  echo "  tag $release_tag on ${new_rebrand:0:10} (starts the Maven Central release)"
+fi
 if [[ "$orphan" == 1 && -n "$prev_rebrand" ]]; then
   echo
   echo "  First generated sync: origin/$REBRAND_BRANCH will be REPLACED by a new"
@@ -208,10 +247,14 @@ if [[ "$orphan" == 1 ]]; then
 else
   g push --quiet origin "$new_rebrand:refs/heads/$REBRAND_BRANCH"
 fi
+if [[ -n "$release_tag" ]]; then
+  g push --quiet origin "$new_rebrand:refs/tags/$release_tag"
+fi
 g fetch --quiet origin
 
 move_local_branch "$MAIN_BRANCH" "$new_main"
 if g rev-parse -q --verify "refs/heads/$REBRAND_BRANCH" >/dev/null; then
+  release_checkout_for_rebrand
   move_local_branch "$REBRAND_BRANCH" "$new_rebrand"
 fi
 

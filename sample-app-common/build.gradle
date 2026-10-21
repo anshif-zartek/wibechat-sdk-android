@@ -21,7 +21,7 @@ final token = getDefaultToken()
 final tokenServerId = getDefaultTokenServerId()
 
 android {
-    namespace "io.wibechat.android.sample.common"
+    namespace "com.wibechat.android.sample.common"
     compileSdk androidSdk.compileVersion
 
     defaultConfig {
@@ -63,7 +63,7 @@ android {
 dependencies {
 
     // If building the sample app outside the context of this repo, replace the following with:
-    // api "io.wibechat:wibechat-android:<version>"
+    // api "com.wibechat:wibechat-android:<version>"
     api project(":wibechat-android-sdk")
     api project(":wibechat-android-camerax")
 

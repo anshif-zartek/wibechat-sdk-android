@@ -6,17 +6,30 @@ Supports Android API level 21 and above.
 
 ## Installation
 
-Add the SDK to your module's `build.gradle`:
+The SDK is on Maven Central. One of its dependencies is served from JitPack, so add
+both repositories in `settings.gradle`:
+
+```groovy
+dependencyResolutionManagement {
+    repositories {
+        google()
+        mavenCentral()
+        maven { url 'https://jitpack.io' }
+    }
+}
+```
+
+Then add the SDK to your module's `build.gradle`:
 
 ```groovy
 dependencies {
-    implementation "io.wibechat:wibechat-android:<version>"
+    implementation "com.wibechat:wibechat-android:<version>"
 
     // Optional: CameraX support
-    implementation "io.wibechat:wibechat-android-camerax:<version>"
+    implementation "com.wibechat:wibechat-android-camerax:<version>"
 
     // Optional: track processors such as virtual background
-    implementation "io.wibechat:wibechat-android-track-processors:<version>"
+    implementation "com.wibechat:wibechat-android-track-processors:<version>"
 }
 ```
 

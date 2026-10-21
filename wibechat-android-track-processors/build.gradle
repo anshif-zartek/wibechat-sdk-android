@@ -6,7 +6,7 @@ plugins {
 }
 
 android {
-    namespace 'io.wibechat.android.track.processing'
+    namespace 'com.wibechat.android.track.processing'
     compileSdkVersion androidSdk.compileVersion
 
     defaultConfig {

@@ -6,7 +6,7 @@ plugins {
 }
 
 android {
-    namespace 'io.wibechat.android.camerax'
+    namespace 'com.wibechat.android.camerax'
     compileSdkVersion androidSdk.compileVersion
 
     defaultConfig {

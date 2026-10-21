@@ -39,7 +39,7 @@ message TokenSourceRequest {
 
   // A RoomConfiguration object can be passed to request extra parameters should be included when
   // generating connection credentials - dispatching agents, defining egress settings, etc
-  // More info: https://docs.wibechat.io
+  // More info: https://wibechat.com
   optional RoomConfiguration room_config = 6;
 }
 

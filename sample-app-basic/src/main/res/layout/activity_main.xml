@@ -5,13 +5,13 @@
     android:layout_height="match_parent"
     tools:context=".MainActivity">
 
-    <io.wibechat.android.renderer.SurfaceViewRenderer
+    <com.wibechat.android.renderer.SurfaceViewRenderer
         android:id="@+id/renderer"
         android:layout_width="match_parent"
         android:layout_height="match_parent" />
 
 
-    <io.wibechat.android.renderer.TextureViewRenderer
+    <com.wibechat.android.renderer.TextureViewRenderer
         android:id="@+id/local_camera"
         android:layout_width="150dp"
         android:layout_height="150dp"

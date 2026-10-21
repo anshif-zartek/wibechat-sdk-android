@@ -25,7 +25,7 @@
 
     <application>
         <service
-            android:name="io.wibechat.android.room.track.screencapture.ScreenCaptureService"
+            android:name="com.wibechat.android.room.track.screencapture.ScreenCaptureService"
             android:enabled="true"
             android:foregroundServiceType="mediaProjection"
             android:stopWithTask="true" />

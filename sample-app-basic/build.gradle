@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace 'io.wibechat.android.sample.basic'
+    namespace 'com.wibechat.android.sample.basic'
     compileSdk 34
 
     defaultConfig {
-        applicationId "io.wibechat.android.sample.basic"
+        applicationId "com.wibechat.android.sample.basic"
         minSdk 21
         targetSdk 34
         versionCode 1
@@ -35,7 +35,7 @@ android {
 dependencies {
 
     // If building the sample app outside the context of this repo, replace the following with:
-    // implementation "io.wibechat:wibechat-android:<version>"
+    // implementation "com.wibechat:wibechat-android:<version>"
     implementation project(":wibechat-android-sdk")
 
     implementation "androidx.core:core-ktx:1.10.1"

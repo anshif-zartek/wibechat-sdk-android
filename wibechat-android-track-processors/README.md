@@ -1,13 +1,13 @@
 # Track Processors for WibeChat Android SDK
 
-[![Maven Central](https://maven-badges.herokuapp.com/maven-central/io.wibechat/wibechat-android-track-processors/badge.svg)](https://maven-badges.herokuapp.com/maven-central/io.wibechat/wibechat-android-camerax)
+[![Maven Central](https://maven-badges.herokuapp.com/maven-central/com.wibechat/wibechat-android-track-processors/badge.svg)](https://maven-badges.herokuapp.com/maven-central/com.wibechat/wibechat-android-camerax)
 
 This library provides track processors for use with the Android WibeChat SDK.
 
 ## Installation
 
 ```groovy title="build.gradle"
-implementation "io.wibechat:wibechat-android-track-processors:<current wibechat sdk release>"
+implementation "com.wibechat:wibechat-android-track-processors:<current wibechat sdk release>"
 ```
 
 See our [release page](https://github.com/anshif-zartek/wibechat-sdk-android/releases) for details on the

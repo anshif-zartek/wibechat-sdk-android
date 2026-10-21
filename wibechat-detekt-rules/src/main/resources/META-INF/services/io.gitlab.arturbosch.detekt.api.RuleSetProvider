@@ -1,1 +1,1 @@
-io.wibechat.detekt.WibechatRuleSetProvider
+com.wibechat.detekt.WibechatRuleSetProvider

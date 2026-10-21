@@ -12,10 +12,10 @@ Supported platforms: Android (minimum API level 21)
 
 ## Architecture
 
-The SDK is provided through the `wibechat-android-sdk` Gradle module (package root `io.wibechat.android`).
+The SDK is provided through the `wibechat-android-sdk` Gradle module (package root `com.wibechat.android`).
 
 ```
-wibechat-android-sdk/src/main/java/io/wibechat/android
+wibechat-android-sdk/src/main/java/com/wibechat/android
 ├── annotations/           # Annotations for marking APIs (e.g. @Beta)
 ├── audio/                 # AudioHandler, AudioProcessingController
 ├── coroutines/            # Utility methods relating to coroutines
@@ -41,7 +41,7 @@ wibechat-android-sdk/src/main/java/io/wibechat/android
 └── webrtc/                # WebRTC helper classes and extensions
 ```
 
-Entry types such as `WibeChat` and `ConnectOptions` live in the `io.wibechat.android` package alongside these directories.
+Entry types such as `WibeChat` and `ConnectOptions` live in the `com.wibechat.android` package alongside these directories.
 
 Key components:
 
@@ -64,7 +64,7 @@ Key classes:
 - `PeerConnectionTransport` - wraps a `PeerConnection`; handles ICE candidates, SDP offer/answer
 - `RTCEngine` - integrates the SignalClient and PeerConnectionTransport into a consolidated
   connection
-- `io.wibechat.android.webrtc` package - convenience extensions on WebRTC types
+- `com.wibechat.android.webrtc` package - convenience extensions on WebRTC types
 
 Threading:
 
@@ -105,7 +105,7 @@ var identity: Identity? by flowDelegate(identity)
 
 Unit tests are provided through the `wibechat-android-test` module.
 
-- `io.wibechat.android.test.mock` package - mocks and fakes
+- `com.wibechat.android.test.mock` package - mocks and fakes
 - `MockE2ETest` - the base class for when testing `Room` behavior
 
 `wibechat-android-test` is setup as a friend module to `wibechat-android-sdk`, so that internal

@@ -1,6 +1,6 @@
 # WibeChat participant RPCs registry (roomrpc)
 
-These protos describe a list of well-known [WibeChat participant RPCs](https://docs.wibechat.io)
+These protos describe a list of well-known [WibeChat participant RPCs](https://wibechat.com)
 and corresponding request/response messages.
 
 ## Directory structure

@@ -134,7 +134,7 @@ nexusPublishing {
             snapshotRepositoryUrl.set(uri("https://central.sonatype.com/repository/maven-snapshots/"))
             username = getRepositoryUsername()
             password = getRepositoryPassword()
-            stagingProfileId = STAGING_PROFILE_ID
+            if (STAGING_PROFILE_ID) stagingProfileId = STAGING_PROFILE_ID
         }
     }
 }
