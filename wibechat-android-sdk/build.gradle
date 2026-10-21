@@ -1,0 +1,192 @@
+plugins {
+    id "org.jetbrains.dokka"
+    id 'com.android.library'
+    id 'kotlin-android'
+    id 'kotlin-kapt'
+    id 'kotlinx-serialization'
+    id 'com.google.protobuf'
+    id 'jacoco'
+    id("com.mxalbert.gradle.jacoco-android") version "0.2.1"
+}
+
+android {
+    namespace 'io.wibechat.android'
+    compileSdkVersion androidSdk.compileVersion
+
+    defaultConfig {
+        minSdkVersion androidSdk.minVersion
+        targetSdkVersion androidSdk.targetVersion
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        consumerProguardFiles 'consumer-rules.pro'
+
+        buildConfigField "String", "VERSION_NAME", "\"$VERSION_NAME\""
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    testOptions {
+        unitTests {
+            includeAndroidResources = true
+        }
+    }
+    compileOptions {
+        sourceCompatibility java_version
+        targetCompatibility java_version
+    }
+    packagingOptions {
+        resources {
+            excludes += ['**/*.proto']
+        }
+    }
+
+    buildFeatures {
+        buildConfig = true
+    }
+    kotlinOptions {
+        freeCompilerArgs = ["-Xinline-classes", "-opt-in=kotlin.RequiresOptIn", "-opt-in=io.wibechat.android.annotations.Beta"]
+        jvmTarget = java_version
+    }
+
+    publishing {
+        singleVariant("release") {
+            withJavadocJar()
+            withSourcesJar()
+        }
+    }
+
+}
+
+ext.wibechatProtoIncludes = [
+        'wibechat_models.proto',
+        'wibechat_rtc.proto',
+        'wibechat_metrics.proto',
+]
+apply from: rootProject.file('gradle/wibechat-protobuf.gradle')
+
+jacoco {
+    toolVersion = "0.8.14"
+}
+
+tasks.withType(Test) {
+    jacoco.includeNoLocationClasses = true
+    jacoco.excludes = ['jdk.internal.*']
+}
+
+jacocoAndroidUnitTestReport {
+    excludes.add('wibechat/**')
+}
+
+dokkaHtml {
+    moduleName.set("wibechat-android-sdk")
+    dokkaSourceSets {
+        configureEach {
+            skipEmptyPackages.set(true)
+            includeNonPublic.set(false)
+            includes.from("module.md")
+            displayName.set("SDK")
+            sourceLink {
+                localDirectory.set(file("src/main/java"))
+
+                // URL showing where the source code can be accessed through the web browser
+                remoteUrl.set(new URL(
+                    "https://github.com/anshif-zartek/wibechat-sdk-android/tree/master/wibechat-android-sdk/src/main/java"))
+                // Suffix which is used to append the line number to the URL. Use #L for GitHub
+                remoteLineSuffix.set("#L")
+            }
+
+            perPackageOption {
+                matchingRegex.set(".*\\.dagger.*")
+                suppress.set(true)
+            }
+
+            perPackageOption {
+                matchingRegex.set(".*\\.util.*")
+                suppress.set(true)
+            }
+        }
+    }
+}
+
+interface InjectedFileSystemOperations {
+    @javax.inject.Inject
+    FileSystemOperations getFs()
+}
+
+// AGP generates the published javadoc with Dokka 1.4.32, which fails to read the sealed classes
+// in livekit-uniffi-android ("PermittedSubclasses requires ASM9"). The generation task fills its
+// output directory from this project's Dokka instead, and the javadoc jar packages that directory.
+tasks.withType(com.android.build.gradle.tasks.JavaDocGenerationTask).configureEach { task ->
+    def fs = objects.newInstance(InjectedFileSystemOperations).fs
+    def dokkaJavadocOutput = files(tasks.named("dokkaJavadoc"))
+    task.inputs.files(dokkaJavadocOutput)
+    task.actions.clear()
+    task.doLast { generationTask ->
+        fs.sync {
+            from(dokkaJavadocOutput)
+            into(generationTask.outputDirectory)
+        }
+    }
+}
+
+dependencies {
+    //api fileTree(dir: 'libs', include: ['*.jar'])
+    implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk7:$kotlin_version"
+    implementation libs.coroutines.lib
+    implementation libs.kotlinx.serialization.json
+    implementation libs.wibechat.uniffi
+    api libs.webrtc
+    api libs.okhttp.lib
+    implementation libs.okhttp.coroutines
+    api libs.audioswitch
+    implementation libs.jwtdecode
+
+    implementation libs.androidx.annotation
+    implementation libs.androidx.core
+    implementation libs.protobuf.javalite
+
+    implementation libs.android.jain.sip.ri
+
+    implementation libs.dagger.lib
+    kapt libs.dagger.compiler
+
+    api libs.semver4j
+
+    lintChecks project(':wibechat-lint')
+    lintPublish project(':wibechat-lint')
+
+    testImplementation libs.junit
+    testImplementation libs.robolectric
+    testImplementation libs.mockito.core
+    testImplementation libs.mockito.kotlin
+    testImplementation libs.androidx.test.core
+    testImplementation libs.coroutines.test
+    kaptTest libs.dagger.compiler
+    androidTestImplementation libs.androidx.test.junit
+    androidTestImplementation libs.espresso
+}
+
+apply from: rootProject.file('gradle/gradle-mvn-push.gradle')
+apply from: rootProject.file('gradle/dokka-kotlin-dep-fix.gradle')
+
+afterEvaluate {
+    publishing {
+        publications {
+            // Creates a Maven publication called "release".
+            release(MavenPublication) {
+                // Applies the component for the release build variant.
+                from components.release
+
+                // You can then customize attributes of the publication as shown below.
+                groupId = GROUP
+                artifactId = POM_ARTIFACT_ID
+                version = VERSION_NAME
+            }
+        }
+    }
+}

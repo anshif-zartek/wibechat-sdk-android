@@ -1,0 +1,60 @@
+# Kotlin Serialization Proguard Rules
+########################################
+
+-keepattributes *Annotation*, InnerClasses
+-dontnote kotlinx.serialization.AnnotationsKt # core serialization annotations
+
+# kotlinx-serialization-json specific. Add this if you have java.lang.NoClassDefFoundError kotlinx.serialization.json.JsonObjectSerializer
+-keepclassmembers class kotlinx.serialization.json.** {
+    *** Companion;
+}
+-keepclasseswithmembers class kotlinx.serialization.json.** {
+    kotlinx.serialization.KSerializer serializer(...);
+}
+
+-keep,includedescriptorclasses class io.wibechat.android.**$$serializer { *; }
+
+-keepclasseswithmembers class io.wibechat.android.** {
+    kotlinx.serialization.KSerializer serializer(...);
+}
+
+# WebRTC
+#########################################
+# Ensure JNI native method names and descriptors are preserved (Java -> native).
+-keepclasseswithmembernames,includedescriptorclasses class livekit.org.webrtc.** {
+    native <methods>;
+}
+
+# Ensure java methods called from Native are preserved (native -> Java).
+-keepclasseswithmembers,includedescriptorclasses class * {
+    @wibechat.**.CalledByNative <methods>;
+}
+-keepclasseswithmembers,includedescriptorclasses class * {
+    @wibechat.**.CalledByNativeUnchecked <methods>;
+}
+
+# NIST sdp parser
+#########################################
+# Preserve reflection used for Parser registrations
+-keep class android.gov.nist.javax.sdp.parser.*Parser { *; }
+-keep class android.gov.nist.javax.sdp.parser.ParserFactory { *; }
+-keep class android.gov.nist.javax.sdp.parser.SDPParser { *; }
+
+# Protobuf
+#########################################
+-keepclassmembers class wibechat.** extends com.google.protobuf.GeneratedMessageLite {
+  <fields>;
+}
+-keepclassmembers class com.google.protobuf.** extends com.google.protobuf.GeneratedMessageLite {
+  <fields>;
+}
+
+# JNA (UniFFI data track bindings)
+#########################################
+# libjnidispatch looks up JNA's classes and fields by name, and JNA reads the bindings'
+# Structure and Callback subclasses reflectively. livekit-uniffi-android ships no rules for
+# either. These are the rules from JNA's FAQ.
+-dontwarn java.awt.*
+-keep class com.sun.jna.* { *; }
+-keep class * extends com.sun.jna.* { *; }
+-keepclassmembers class * extends com.sun.jna.* { public *; }

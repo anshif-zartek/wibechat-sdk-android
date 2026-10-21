@@ -1,0 +1,3 @@
+<component name="DependencyValidationManager">
+  <scope name="Library Projects" pattern="file[wibechat-android.wibechat-android-sdk*]:*//*||file[wibechat-android.wibechat-android-camerax*]:*//*||file[wibechat-android.wibechat-android-test*]:*//*||file[wibechat-android.wibechat-lint*]:*//*" />
+</component>

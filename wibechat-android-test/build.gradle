@@ -1,0 +1,161 @@
+plugins {
+    id "org.jetbrains.dokka"
+    id 'com.android.library'
+    id 'kotlin-android'
+    id 'kotlin-kapt'
+    id 'com.google.protobuf'
+}
+
+android {
+    namespace 'io.wibechat.android.test'
+    compileSdkVersion androidSdk.compileVersion
+
+    defaultConfig {
+        minSdkVersion androidSdk.minVersion
+        targetSdkVersion androidSdk.targetVersion
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        consumerProguardFiles "consumer-rules.pro"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    compileOptions {
+        sourceCompatibility java_version
+        targetCompatibility java_version
+    }
+    kotlinOptions {
+        freeCompilerArgs = ["-Xinline-classes", "-opt-in=kotlin.RequiresOptIn", "-opt-in=io.wibechat.android.annotations.Beta"]
+        jvmTarget = java_version
+    }
+    testOptions {
+        unitTests {
+            includeAndroidResources = true
+        }
+    }
+    lint {
+        disable 'VisibleForTests'
+    }
+}
+
+ext.wibechatProtoIncludes = [
+        'wibechat_token_source.proto',
+        'wibechat_room.proto',
+        'wibechat_agent_dispatch.proto',
+        'wibechat_agent.proto',
+        'wibechat_egress.proto',
+]
+ext.wibechatProtoImportSrc = true
+apply from: rootProject.file('gradle/wibechat-protobuf.gradle')
+
+// Allow this module's Kotlin compilations to resolve `internal` APIs from :wibechat-android-sdk
+// https://kotlinlang.org/docs/visibility-modifiers.html#modules
+//
+// Use projectsEvaluated so :wibechat-android-sdk Kotlin compile tasks exist before friendPaths
+// references them.
+gradle.projectsEvaluated {
+    def sdk = rootProject.project(':wibechat-android-sdk')
+    project.tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach { task ->
+        def variant
+        if (task.name.startsWith('compileDebug')) {
+            variant = 'Debug'
+        } else if (task.name.startsWith('compileRelease')) {
+            variant = 'Release'
+        } else {
+            return
+        }
+        // Point at the same `classes.jar` AGP puts on the compile classpath (not only `tmp/kotlin-classes`),
+        // or Kotlin will not treat the SDK as a friend module for `internal` visibility.
+        task.friendPaths.from(sdk.tasks.named("bundleLibCompileToJar${variant}"))
+    }
+}
+
+dokkaHtml {
+    moduleName.set("wibechat-android-test")
+    dokkaSourceSets {
+        configureEach {
+            skipEmptyPackages.set(true)
+            includeNonPublic.set(false)
+            includes.from("module.md")
+            displayName.set("WibeChat Mocks")
+            sourceLink {
+                localDirectory.set(file("src/main/java"))
+
+                // URL showing where the source code can be accessed through the web browser
+                remoteUrl.set(new URL(
+                    "https://github.com/anshif-zartek/wibechat-sdk-android/tree/master/wibechat-android-test/src/main/java"))
+                // Suffix which is used to append the line number to the URL. Use #L for GitHub
+                remoteLineSuffix.set("#L")
+            }
+
+            perPackageOption {
+                matchingRegex.set(".*\\.dagger.*")
+                suppress.set(true)
+            }
+
+            perPackageOption {
+                matchingRegex.set(".*\\.util.*")
+                suppress.set(true)
+            }
+        }
+    }
+}
+
+dependencies {
+
+    implementation(project(":wibechat-android-sdk"))
+    implementation libs.wibechat.uniffi
+    implementation libs.coroutines.lib
+    implementation libs.kotlinx.serialization.json
+    api libs.okhttp.lib
+    api libs.audioswitch
+    implementation libs.androidx.annotation
+    api libs.protobuf.javalite
+    implementation libs.android.jain.sip.ri
+    implementation libs.junit
+    implementation libs.robolectric
+    implementation libs.mockito.core
+    implementation libs.mockito.kotlin
+    implementation libs.mockito.inline
+    implementation libs.androidx.test.core
+    implementation libs.coroutines.test
+    implementation libs.dagger.lib
+    implementation libs.byte.buddy
+    kapt libs.dagger.compiler
+
+    testImplementation libs.junit
+    testImplementation libs.robolectric
+    testImplementation libs.okhttp.mockwebserver
+    testImplementation "org.jetbrains.kotlin:kotlin-reflect:$kotlin_version"
+    kaptTest libs.dagger.compiler
+
+    androidTestImplementation libs.androidx.test.junit
+    androidTestImplementation libs.espresso
+}
+tasks.withType(Test).configureEach {
+    systemProperty "robolectric.logging.enabled", true
+}
+
+apply from: rootProject.file('gradle/gradle-mvn-push.gradle')
+apply from: rootProject.file('gradle/dokka-kotlin-dep-fix.gradle')
+
+afterEvaluate {
+    publishing {
+        publications {
+            // Creates a Maven publication called "release".
+            release(MavenPublication) {
+                // Applies the component for the release build variant.
+                from components.release
+
+                // You can then customize attributes of the publication as shown below.
+                groupId = GROUP
+                artifactId = POM_ARTIFACT_ID
+                version = VERSION_NAME
+            }
+        }
+    }
+}
