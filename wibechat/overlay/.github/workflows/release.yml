@@ -54,6 +54,7 @@ jobs:
           ./gradlew
           publishReleasePublicationToMavenRepository
           closeAndReleaseMavenStagingRepository
+          --no-configuration-cache
           -Dorg.gradle.parallel=false
           -PVERSION_NAME=${{ steps.version.outputs.version }}
           -PnexusUsername="$CENTRAL_USERNAME"
