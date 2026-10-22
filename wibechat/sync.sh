@@ -259,3 +259,7 @@ if g rev-parse -q --verify "refs/heads/$REBRAND_BRANCH" >/dev/null; then
 fi
 
 step "Synced $MAIN_BRANCH and $REBRAND_BRANCH (v$version)"
+if [[ -n "$prev_rebrand" && "$new_rebrand" != "$prev_rebrand" && -n "$(worktree_of "$REBRAND_BRANCH")" ]]; then
+  echo "Files changed under your checkout: in Android Studio, run"
+  echo "File > Sync Project with Gradle Files before building or running."
+fi
